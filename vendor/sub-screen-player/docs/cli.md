@@ -1,0 +1,760 @@
+# Command line guide
+
+[日本語](cli.ja.md)
+
+Everything is done with one command, `ssp`. `ssp serve` runs the daemon that owns the
+displays; every other command asks that daemon to do something, over its
+[HTTP API](api.md).
+
+- [Use cases](#use-cases): recipes for common tasks
+- [Command reference](#command-reference): every command and option
+- [Troubleshooting](#troubleshooting)
+
+## Use cases
+
+### Show a clock whenever you are logged in
+
+```sh
+ssp service install
+```
+
+The daemon now starts at login and shows the clock on every display it finds. To change the
+clock's look permanently, create a config file and edit its `[clock]` section:
+
+```sh
+ssp config init        # writes a commented config file and prints its path
+```
+
+```toml
+[clock]
+seconds = false
+date_format = "%a %-d %b"     # e.g. "Wed 7 Oct"; "" hides the date
+color = "#FFD080"
+```
+
+Then apply it with `ssp config reload` (see [Config file](#config-file)).
+
+For dates in another language, list the weekday names from Sunday in `weekdays`; `%a` (and `%A`)
+then print those names. Characters the built-in font lacks (e.g. Japanese) are drawn with a font
+installed on the system (Hiragino on macOS, Yu Gothic or Meiryo on Windows, Noto Sans CJK and similar
+on Linux). If Japanese does not show on Linux, install a package such as `fonts-noto-cjk`.
+
+```toml
+[clock]
+date_format = "%Y年%m月%d日（%a）"     # e.g. "2026年10月08日（木）"
+weekdays = ["日", "月", "火", "水", "木", "金", "土"]
+```
+
+To change the clock just for now, use options instead:
+
+```sh
+ssp clock --no-seconds --date-format ""
+```
+
+### Show CPU, memory and network use next to the time
+
+```sh
+ssp dashboard
+```
+
+The dashboard shows the time (formatted as in `[clock]`) next to panels for CPU, memory, network
+and disk use. CPU, memory and network come with a graph of the last minute. The network panel
+shows the download speed with the upload speed below it (loopback is not counted), and the disk
+panel the space used on the system disk (`/`, or `C:\` on Windows). Pick and order the panels with
+`--widgets`:
+
+```sh
+ssp dashboard --widgets clock,cpu,network
+```
+
+To show the dashboard at login instead of the clock, and to keep your panels and colors, edit the
+config file and apply it with `ssp config reload`:
+
+```toml
+[startup]
+show = "dashboard"
+
+[dashboard]
+widgets = ["clock", "cpu", "memory", "network"]
+accent = "#FFD080"       # color of the graphs
+```
+
+### Show your own figures: CI status, a queue, the weather
+
+Any script can put a figure on the dashboard. Send it with `ssp metric set` (or
+[the API](api.md#metrics)) and add a `metric:<id>` panel:
+
+```sh
+ssp metric set ci --value 2 --label CI --unit failed --detail "main · 39 of 41 jobs passed"
+ssp metric set deploy --text live --label Deploy --detail "v0.3.0"
+ssp dashboard --widgets clock,metric:ci,metric:deploy,cpu
+```
+
+![Panels for a CI status, a deployment and a queue](images/dashboard-metrics.png)
+
+Each `--value` is also added to the panel's graph. Send a new value whenever it changes, e.g. from
+cron or a CI job; `--value -` reads the number from standard input:
+
+```sh
+uptime | awk '{print $(NF-2)}' | tr -d , | ssp metric set load --value - --label "Load"
+```
+
+A value older than `--ttl` seconds (default 300) is dimmed and says how old it is, so a stopped
+script does not leave a figure that looks current. Metrics are kept in memory only: after the daemon
+restarts, panels say "waiting for data" until the next value arrives (`ssp config reload` keeps
+them).
+[contrib/metrics/github-ci.sh](../contrib/metrics/github-ci.sh) is a complete example that shows
+how the last GitHub Actions runs of a branch went.
+
+### Show how much Claude Code you have used
+
+```sh
+ssp dashboard --widgets clock,claude-code,cpu,memory
+```
+
+![The Claude Code panel next to the clock, CPU and memory](images/dashboard-claude-code.png)
+
+The `claude-code` panel adds up the tokens of every Claude Code session on this computer
+(subagents included):
+
+- the large figure is the current 5-hour block, with the time it ends: a block starts at the
+  hour of the first reply after the previous block ended and lasts five hours, which is how
+  Claude's usage limits are usually tracked. It is an estimate from your logs, not the limit
+  Anthropic counts;
+- `today` is the total since midnight;
+- the graph shows tokens per minute over the last hour.
+
+Input, output and cache-creation tokens are counted. Cache reads (the conversation read again on
+every turn, billed at a fraction) are not, or they would dwarf the rest.
+
+**What is read**: the session logs Claude Code keeps in `~/.claude/projects/` (or under
+`$CLAUDE_CONFIG_DIR`, or `~/.config/claude`), of which only the token counts and times of the
+replies are used. Nothing is sent anywhere, and nothing is read until a dashboard shows the
+panel. The first read of a day's logs takes about a second; after that, only new lines are read,
+every 30 seconds. Point it elsewhere with `[claude_code] dir` in the config. The same figures are
+available to scripts as the metric `claude-code` (`ssp metric list`,
+[`GET /api/v1/metrics/claude-code`](api.md#metrics)).
+
+### Get notified: Claude Code waiting, a failed CI run
+
+```sh
+ssp notify "Build finished" --color green
+ssp notify "CI failed" --detail "main · 2 of 41 jobs" --color red --sticky
+ssp notify --dismiss
+```
+
+![A notification over the clock](images/notify.png)
+
+`ssp notify` draws a message over whatever the display shows, for 10 seconds (`--for
+<time>`, such as `60` or `5m`, up to a day) or until it is dismissed or replaced (`--sticky`); then the screen goes
+back to what it showed. The content keeps running underneath: the clock keeps ticking above the
+banner, a video keeps playing. A new notification replaces the current one. `--detail` adds a
+smaller line, `--color` sets the background (`red`, `orange`, `yellow`, `green`, `blue`, `gray`
+or `#rrggbb`), and `--style full` covers the whole panel instead of the bottom third. A screen
+that is off stays off unless `--wake` is given; then it goes off again when the notification
+ends. The notification stays when the content changes and while the display is unplugged;
+`ssp status` shows it with the time left, and `ssp clear` ends it.
+
+**Claude Code** runs hooks when it needs you and when it finishes. One command adds two that
+notify on the display:
+
+```sh
+ssp claude-code hooks --install    # adds them to ~/.claude/settings.json
+ssp claude-code hooks              # only shows them
+ssp claude-code hooks --uninstall  # removes them again
+```
+
+`--install` adds the hooks to Claude Code's settings (`$CLAUDE_CONFIG_DIR/settings.json` if set),
+keeps everything else in the file and the old file as `settings.json.bak`, and does nothing if
+they are there already. New Claude Code sessions use them. The hooks are:
+
+```json
+{
+  "hooks": {
+    "Notification": [
+      { "hooks": [{ "type": "command", "command": "ssp notify --stdin --for 60 --if-running" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "ssp notify \"Claude Code is done\" --stdin --color green --if-running" }] }
+    ]
+  }
+}
+```
+
+(with the full path of `ssp`). `--if-running` keeps Claude Code quiet when the daemon is not
+running or no display is connected. With `--stdin`, `ssp notify` reads what the hook gets: the message ("Claude needs your permission
+to use Bash") becomes the text, and the project folder and the first line of Claude's last
+reply the detail. Plain text works too: the first line is the text, the rest the detail.
+
+**CI or any script**: run `ssp notify` when a job fails, or send `POST /api/v1/displays/{id}/notify`
+from another computer (see the [API guide](api.md)).
+
+### Keep a picture on the screen, even when the computer is off
+
+```sh
+ssp show wallpaper.png --fit cover --persist
+```
+
+`--persist` also stores the image on the display, so it comes back after the computer is shut
+down or the display is replugged. Without it, the picture is only shown while the daemon runs.
+
+Storing writes the display's flash memory and takes a moment (about 1.5 s on the D92). Use it
+for pictures you keep for a while, not for animations or things that change every minute.
+
+To have the last picture stored automatically whenever the daemon exits, set this in the
+config file:
+
+```toml
+[display]
+on_exit = "save-last"
+```
+
+### Play a video
+
+```sh
+ssp show clip.mp4 --fit cover
+```
+
+Videos play in a loop, at their own frame rate up to 60 fps, through the
+[ffmpeg](https://ffmpeg.org/) installed on your computer (`ssp` has no video decoder of its
+own). Install it with `brew install ffmpeg` (macOS), `sudo apt install ffmpeg` (Debian, Ubuntu)
+or `winget install ffmpeg` (Windows); if the daemon cannot find it (a service started at login
+may not see your `PATH`), set its path in the config:
+
+```toml
+[video]
+ffmpeg = "/opt/homebrew/bin/ffmpeg"
+```
+
+Sound is ignored. Decoding a 720p video at 30 fps costs ffmpeg about a fifth of a CPU core on an Apple Silicon Mac.
+How smooth it looks depends on the display: the D92 takes about 2.2 MB/s, so a detailed
+full-screen video runs at about 40 fps, a calmer one at 60. To play a video whenever the daemon
+starts, set `show = "image"` and `image = "/path/to/clip.mp4"` in `[startup]`.
+
+### Show a web page
+
+```sh
+ssp web contrib/web/day.html
+ssp web https://example.com/status --reload 600
+```
+
+![A web page showing the time and how much of the day has gone](images/web-day.png)
+
+Anything you can build with HTML, CSS and JavaScript can be a screen: a page is drawn by headless
+Chrome at the panel's size (1920x462 on the D92) and sent to the display whenever it repaints, so
+CSS animations and pages that update themselves run as they would in a browser, at up to 30 fps
+(`[web] fps`, see below).
+[contrib/web/day.html](../contrib/web/day.html) is a small example to start from. `--reload`
+reloads the page every so many seconds, for pages that do not update themselves. A file is passed
+to the daemon as a `file://` URL, so with a daemon on another computer it has to be there.
+
+A page can also read the daemon's figures and draw its own dashboard: your metrics, the Claude
+Code usage, and the CPU, memory, network and disk figures. The daemon gives each page it shows
+a token that only reads (`window.ssp`); see "Pages shown with `ssp web`" in the
+[API guide](api.md). [contrib/web/system.html](../contrib/web/system.html) shows how.
+
+The [screen gallery](https://subscreen.dev/screens/) has ready-made pages of this kind, served
+from the website: `ssp web https://subscreen.dev/screens/system/` shows the time with the CPU,
+memory, disk and network, `/screens/claude-code/` the Claude Code usage and `/screens/metrics/`
+your metrics. The page and its fonts come from the internet; the figures come from your own
+daemon and stay on your computer.
+
+**Headless Chrome** is not part of `ssp`. The first `ssp web` asks to download it (about 100 MB,
+from Google's [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/)) into
+`~/Library/Application Support/sub-screen-player/chrome` (macOS),
+`~/.local/share/sub-screen-player/chrome` (Linux) or
+`%LOCALAPPDATA%\sub-screen-player\data\chrome` (Windows). `ssp web --install` downloads it
+without showing anything, and again later to update it; `--yes` skips the question. To use an
+installed Chrome, Chromium or Edge instead, set it in the config:
+
+```toml
+[web]
+chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+```
+
+The browser runs only while a page is shown and uses a fresh, empty profile each time: no
+cookies, logins or extensions of your own browser. JavaScript is on, and a page can load whatever
+it links to, so show pages you trust. A browser costs 300-400 MB of memory. On an Apple Silicon
+Mac, a page that changes once a second costs the browser and the daemon a few percent of a CPU
+core; one that moves all the time (a CSS animation) about 40 % at 30 fps and 50 % at 60. Most of
+that is the browser drawing the page, so animations and transitions that run all the time cost
+the most. `[web] fps` (1-60, default 30) sets how many frames a second are taken from a page while
+it changes; the last change is always shown. Chrome 153 and older send every frame. If a page
+cannot be shown (no network, a missing file, a browser that cannot start), the display says why.
+On Linux, a downloaded Chrome needs the usual browser libraries; if it does not start, install
+`chromium` from your distribution and set `[web] chrome` to it; on Ubuntu, `sudo apt install chromium`
+installs the snap, which is `chrome = "/snap/bin/chromium"` (from v0.8.1). To show a page whenever
+the daemon starts:
+
+```toml
+[startup]
+show = "web"
+url = "file:///home/me/panel.html"
+reload = 600       # optional
+```
+
+### Show several things side by side
+
+```sh
+ssp layout clock video:~/Movies/loop.mp4 metric:ci --widths 34,40,26 --fit cover
+ssp layout clock claude-code web:panel.html --widths 30,,30
+```
+
+![The clock, a video and a metric panel side by side](images/layout.png)
+
+`ssp layout` splits the panel into zones from left to right, each with its own content, without a
+browser. A zone is a dashboard panel (`clock`, `cpu`, `memory`, `network`, `disk`, `claude-code`,
+`metric:<id>`), `dashboard`, `image:<file>` or `video:<file>` (a picture, animation or video),
+`web:<URL or file>`, `stream` (frames a program sends, see below), or `nothing`. `--widths` gives widths in percent; zones without one share
+the rest (`30,,30`). Each zone runs on its own: the clock keeps ticking next to a video, and with
+partial updates only the zone that changed is sent. A layout plays one video and shows one web
+page at most.
+
+In the config, `[layout]` takes the same zones, a `width` as a share (`0.3`) or in pixels
+(`480`), and is shown with `show = "layout"` in `[startup]`, a schedule entry or a rotation:
+
+```toml
+[startup]
+show = "layout"
+
+[layout]
+zones = [
+  { show = "clock", width = 0.34 },
+  { show = "image", image = "/home/me/loop.mp4", fit = "cover" },
+  { show = "metric:ci", width = 0.26 },
+]
+gap = 16                 # pixels between zones
+```
+
+More layouts can have names. `[layouts.<name>]` takes what `[layout]` takes, and `layout =
+"<name>"` next to `show = "layout"` picks one, for example another layout in the evening:
+
+```toml
+[layouts.evening]
+zones = [{ show = "clock", width = 0.4 }, { show = "metric:ci" }]
+
+[[schedule]]
+at = "19:00"
+show = "layout"
+layout = "evening"
+```
+
+`ssp layout --name evening` shows one by hand.
+
+A `stream` zone shows the frames a program sends over a [WebSocket stream](api.md#websocket-stream)
+opened with `?zone=true`, while the other zones keep running: a game or a chart next to the
+daemon's clock, for example. At most one zone of a layout is a `stream` zone.
+
+### Show something for a while, then go back
+
+`--for` shows something for a while, then what the display showed before:
+
+```sh
+ssp show build-failed.png --for 10m
+ssp web https://example.com/standup.html --for 15m
+ssp clear --for 1h        # black for an hour
+```
+
+The time is seconds (`90`) or a number with `s`, `m` or `h` (`90s`, `10m`, `2h`), up to a week.
+`ssp show`, `web`, `clock`, `dashboard`, `layout`, `stop` and `clear` take it, and `ssp status`
+shows how long is left. Another change before then (by hand, the schedule's next entry, a
+stream) ends it early. Several in a row go back to what showed before the first one. To show a
+message over the screen instead, use `ssp notify`.
+
+### Stop, blank or turn off the screen
+
+| Command | What happens to the picture | The screen | The clock / dashboard / image / stream |
+|---|---|---|---|
+| `ssp stop` | stays as it is | on | stopped |
+| `ssp clear` | becomes black | on | stopped |
+| `ssp off` | is kept | off (backlight off) | keeps running |
+| `ssp on` | | on again | |
+
+Start something again with `ssp clock` or `ssp show ...`. A notification (`ssp notify`) stays
+over `ssp stop` and `ssp off`; `ssp clear` ends it.
+
+### Change the screen by time of day, or show screens in turn
+
+Add `[[schedule]]` entries to the config file and run `ssp config reload`. Each entry sets what it
+names from its local time on: `show` (with the options of `[startup]`, such as `url` or
+`image`), `brightness` and `power`:
+
+```toml
+# Weekdays: the dashboard while working. Evenings: the clock, dimmer. Night: off.
+[[schedule]]
+at = "09:00"
+days = ["mon", "tue", "wed", "thu", "fri"]
+show = "dashboard"
+brightness = 100
+
+[[schedule]]
+at = "19:00"
+show = "clock"
+brightness = 40
+
+[[schedule]]
+at = "01:00"
+power = "off"
+
+# Weekends: the clock, from nine.
+[[schedule]]
+at = "09:00"
+days = ["sat", "sun"]
+show = "clock"
+brightness = 60
+```
+
+What an entry sets stays until another entry sets it again: at any moment, each of show,
+brightness and power is what the latest entry setting it said, looking back up to a week. So
+without the weekend entry above, the screen would stay off all weekend after Saturday 01:00. An
+entry that shows something also switches the screen on, unless it says `power = "off"`. `days`
+(`"mon"` to `"sun"`) limits an entry to some days, and `display = "<id>"` to one display. When
+the daemon starts or a display connects, it gets what the schedule says at that moment.
+
+Changes by hand (`ssp clock`, `ssp brightness`, `ssp off`, the API) last until the next entry,
+or until their `--for` time is up.
+A WebSocket stream lasts until its sender ends it: two seconds later, the display shows what
+the schedule says. `ssp schedule` shows the last and the next entries; `ssp schedule pause` stops the changes, and
+`ssp schedule resume` applies what the schedule says now and starts them again.
+
+**Screens in turn**: `show = "rotation"` (in an entry, or in `[startup]` to rotate all day) shows
+the screens of `[rotation]` one after another:
+
+```toml
+[rotation]
+every = 30               # seconds per screen
+show = ["clock", "dashboard", { show = "web", url = "file:///home/me/panel.html", seconds = 60 }]
+```
+
+A screen runs only during its turn: a web page's browser starts when its turn comes (the
+previous picture stays until the page is drawn, about a second) and stops after it.
+
+### Several displays
+
+```sh
+ssp devices
+```
+
+```text
+ID                MODEL       SIZE      CONTENT  STATE
+d92-470B03781D1F  upHere D92  1920x462  clock    connected
+d92-5C2A11FE0A42  upHere D92  1920x462  clock    connected
+```
+
+Pick a display with `-d` / `--display`:
+
+```sh
+ssp -d d92-470B03781D1F clock
+ssp -d d92-5C2A11FE0A42 show photo.jpg
+```
+
+Without `--display`, commands go to `default`: the first connected display in id order.
+Each display remembers what it shows, also when it is unplugged and plugged in again.
+
+### Control the display from another computer
+
+By default the daemon only accepts connections from the same computer. To allow others, set
+an address and a token in the config file of the computer the display is attached to:
+
+```toml
+listen = "0.0.0.0:7920"
+token = "a-long-random-string-of-at-least-16-characters"
+```
+
+Then, on the other computer:
+
+```sh
+export SSP_URL=http://192.168.1.10:7920
+export SSP_TOKEN=a-long-random-string-of-at-least-16-characters
+ssp status
+ssp show photo.jpg
+```
+
+The connection is plain HTTP, so the token and images are not encrypted. Only do this on a
+network you trust.
+
+### Show your own content (dashboards, games, ...)
+
+Any program can stream frames to the daemon over a WebSocket, up to 60 frames per second. See
+the example in the [README](../README.md#drawing-from-your-own-program) and the
+[API reference](api.md#websocket-stream). While a stream runs, `ssp devices` shows `stream` as
+the content. `ssp clock` or `ssp show` takes the display back.
+
+Detailed pictures at a high frame rate can be more than the USB link carries: on the D92 a
+detailed 1920x462 frame at JPEG quality 85 takes about 22 ms to send, so about 45 frames per
+second get through. While frames come faster than the display takes them, the JPEG quality is
+lowered (down to `min_quality`, 70 by default) until it keeps up, and raised again as soon as
+it does; `ssp status` shows the quality in use. A clock or a dashboard stays at full quality.
+To always keep the full quality, set `min_quality` to the same value as `quality`:
+
+```toml
+[display]
+quality = 85
+min_quality = 85       # never lower the quality, drop frames instead
+```
+
+Displays that can draw a picture over a part of the screen (the D92 can) get only the parts of
+a frame that changed: a clock sends its seconds as about 4 KB instead of a 50 KB frame, and a
+web page with a small animation only the moving part. `ssp status` shows how many frames went
+in parts. Whole frames still go out every 10 seconds, after any command, and when more than
+half of the screen changes (videos, most animations). To always send whole frames:
+
+```toml
+[display]
+partial_updates = false
+```
+
+### Develop support for a new display while another one keeps running
+
+Say a D92 shows your clock and you are writing a driver `dxxxx` for another display. Run the
+daemon with only the drivers it should use, and test the new display next to it:
+
+```sh
+ssp serve --driver d92            # the daemon leaves every other display alone
+ssp selftest --driver dxxxx       # in another terminal, as often as you like
+ssp devices --driver dxxxx        # is the new display recognized?
+```
+
+A driver that is still being developed can be marked experimental (see
+[Adding a device](adding-a-device.md)); it is then only used when named with `--driver` or in
+`[drivers] enable`, so it never takes over a display by accident.
+
+### Run the daemon by hand
+
+```sh
+ssp serve                                # logs to the terminal, Ctrl-C stops it
+SSP_LOG=debug ssp serve                  # more detail
+ssp serve --listen 127.0.0.1:8000        # another port (then use --url for other commands)
+ssp serve --log-file ~/ssp.log           # log to a file
+```
+
+### Keep ssp up to date
+
+`ssp status` tells you when a newer version is out, and when the daemon still runs a version
+older than the `ssp` you installed:
+
+```
+ssp 0.8.1 is out (this is 0.8.0): https://subscreen.dev/download/
+`ssp update` installs it and restarts the daemon.
+```
+
+`ssp update` updates `ssp` the way it was installed and restarts the daemon of the autostart
+entry, then waits until the daemon answers with the new version:
+
+```sh
+ssp update               # to the latest release
+ssp update --check       # only tell whether a newer release is out
+ssp update --to v0.7.1   # a given release, also to go back
+```
+
+- **Installed with the installer** (or by hand): the website's installer runs again into the
+  same folder, for the release asked, and checks its SHA-256. On Windows, the running `ssp.exe`
+  is moved aside as `ssp.exe.old` (and put back if anything fails); a later `ssp` command
+  removes it.
+- **Homebrew**: `brew update` and `brew upgrade ssp`. `--to` is not available, since Homebrew
+  installs its newest version; the tap follows a release within the hour.
+- **Scoop**: Scoop cannot replace `ssp.exe` while it runs, and `ssp update` is one, so it shows
+  the commands to run instead (`taskkill /im ssp.exe /f`, `scoop update ssp`,
+  `ssp service install`).
+
+Only the autostart entry that runs this `ssp` is restarted. A daemon started by hand
+(`ssp serve`) is left alone, and `ssp update` says to restart it.
+
+To know when a newer version is out, `ssp status` reads
+<https://subscreen.dev/latest.json> at most once a day: a plain `GET` with
+`User-Agent: ssp/<version>`, and nothing else is sent. It waits 2 seconds at most, remembers
+the answer in the data folder, and says nothing when its error output is not a terminal (in
+scripts). The daemon never asks. To turn it off, set `check_updates = false` in the config or
+`SSP_NO_UPDATE_CHECK=1` in the environment.
+
+## Command reference
+
+### Global options
+
+These work with every command.
+
+| Option | Environment variable | Default | Meaning |
+|---|---|---|---|
+| `--config <FILE>` | `SSP_CONFIG` | see [below](#config-file-location) | Config file to use |
+| `--url <URL>` | `SSP_URL` | from `listen` in the config (`http://127.0.0.1:7920`) | Where the daemon is |
+| `--token <TOKEN>` | `SSP_TOKEN` | `token` in the config | API token, if the daemon requires one |
+| `-d`, `--display <ID>` | | `default` | Display to act on (see `ssp devices`) |
+| `-h`, `--help` | | | Help for a command, e.g. `ssp show --help` |
+| `-V`, `--version` | | | Print the version |
+
+`SSP_LOG` sets the daemon's log level for `ssp serve` (`info` by default; e.g. `debug`,
+`ssp_server=debug`).
+
+### Daemon
+
+| Command | Description |
+|---|---|
+| `ssp serve` | Run the daemon in the foreground. Stops on Ctrl-C (or SIGTERM), then applies `on_exit` from the config. |
+| `  --listen <ADDR>` | Address to listen on, e.g. `127.0.0.1:8000`. Overrides `listen` in the config. |
+| `  --log-file <FILE>` | Append logs to a file instead of printing them. |
+| `  --driver <ID>` | Use only this driver (repeatable), e.g. `--driver d92`. Overrides `enable` in the `[drivers]` section of the config. The daemon leaves displays of other drivers alone. |
+| `ssp update` | Update `ssp` to the latest release the way it was installed, and restart the daemon of the autostart entry (see [Keep ssp up to date](#keep-ssp-up-to-date)). |
+| `  --check` | Only tell whether a newer release is out. |
+| `  --to <VERSION>` | Install this release instead, e.g. `v0.7.1` (also to go back). Not with Homebrew. |
+
+### Displays
+
+| Command | Description |
+|---|---|
+| `ssp devices` | List displays: id, model, size, what they show and whether they are connected. If the daemon is not running, lists the supported displays plugged into this computer instead. |
+| `  --json` | Print the full details as JSON (same as `GET /api/v1/displays`). |
+| `  --driver <ID>` | Only list displays of this driver (repeatable). |
+| `ssp status` | Daemon version and, per display, firmware and frame counters: frames shown, dropped (replaced by newer ones), unchanged (skipped) and received, plus the last encode time, send time and size, and the JPEG quality in use. |
+| `ssp selftest` | Check connected displays directly, without the daemon. Runs about 25 s per display and reports PASS / WARN / FAIL per check: open (and firmware), commands (wake, brightness 100%), still image, partial updates (whether a small change is sent as a part, on displays that take parts), streaming (frames per second), keep-alive (still connected after being idle) and power (off and on). Several displays are all opened first and tested one after another. If the daemon is running, displays of the drivers it uses are skipped (it could take them at any moment): stop it, or run it with `--driver` for other drivers only. Exits with 1 if a check fails or nothing could be tested. Use `--display` to test one display. |
+| `  --driver <ID>` | Only test displays of this driver (repeatable). Also enables experimental drivers. |
+| `  --frames <N>` | Frames sent in the streaming check (default 180). |
+| `  --hold <SECONDS>` | How long to stay idle in the keep-alive check (default 15). |
+| `  --json` | Print the report as JSON. |
+
+### What to show
+
+| Command | Description |
+|---|---|
+| `ssp show <FILE>` | Show a PNG, JPEG, GIF or WebP image. Animated GIF, APNG and WebP play in a loop at their own speed. A video (MP4, MOV, WebM, MKV, ...) plays in a loop when ffmpeg is installed. |
+| `  --fit contain` | (default) Fit the whole image and fill the rest with black. |
+| `  --fit cover` | Fill the screen and cut off what sticks out. |
+| `  --fit stretch` | Fill the screen, distorting the image if needed. |
+| `  --persist` | Also store the image on the display so it survives power loss (writes flash memory). For an animation, the first frame is stored. |
+| `ssp clock` | Show the built-in clock. Options not given come from `[clock]` in the config. |
+| `  --no-seconds` | Hide the seconds. |
+| `  --format <FMT>` | Format of the time, e.g. `"%H:%M"` or `"%I:%M %p"` ([strftime syntax](https://docs.rs/jiff/latest/jiff/fmt/strtime/)). |
+| `  --date-format <FMT>` | Format of the date line, e.g. `"%Y-%m-%d %a"`. `""` hides it. |
+| `  --weekdays <NAMES>` | Names printed by `%a` and `%A`: seven, comma-separated, from Sunday, e.g. `日,月,火,水,木,金,土`. |
+| `ssp dashboard` | Show the built-in dashboard: the time, CPU, memory, network, disk and your own metrics. Options not given come from `[dashboard]` in the config. |
+| `  --widgets <LIST>` | Panels from left to right, comma-separated: `clock`, `cpu`, `memory`, `network`, `disk`, `claude-code`, `metric:<id>`. |
+| `ssp metric set <ID>` | Create or update a metric for `metric:<ID>` panels. The id is 1-32 of `a-z`, `0-9` and `-`. Options not given keep their previous value. |
+| `  --value <N>` | The number shown, also added to the graph. `-` reads it from standard input. |
+| `  --text <TEXT>` | A short text shown instead of a number, e.g. `passing`. |
+| `  --label`, `--unit`, `--detail` | Name above the value (default: the id), unit after it, and the line under it. |
+| `  --max <N>` | Top of the graph (default: the largest value in it). |
+| `  --ttl <SECONDS>` | How long the value counts as current (default 300). |
+| `  --series <LIST>` | Replace the graph with these values, oldest first, comma-separated. |
+| `ssp metric list` | List the metrics, with their age. `--json` prints them as JSON. |
+| `ssp metric rm <ID>` | Remove a metric. |
+| `ssp web <URL or FILE>` | Show a web page or a local HTML file, drawn by headless Chrome. Asks to download headless Chrome the first time. |
+| `  --reload <SECONDS>` | Reload the page every so many seconds. |
+| `  --yes`, `-y` | Download headless Chrome without asking, if needed. |
+| `  --install` | Only download (or update) headless Chrome. |
+| `ssp layout <ZONE>...` | Show zones side by side: `clock`, `cpu`, `memory`, `network`, `disk`, `claude-code`, `metric:<id>`, `dashboard`, `image:<FILE>`, `video:<FILE>`, `web:<URL or FILE>`, `stream` or `nothing`. |
+| `  --widths <PERCENT,...>` | Widths of the zones in percent; zones without one share the rest. |
+| `  --gap <PIXELS>` | Space between zones. |
+| `  --fit contain\|cover\|stretch` | How pictures and videos are fitted into their zones. |
+| `ssp layout --name <NAME>` | Show `[layouts.<NAME>]` of the config. |
+| `ssp stop` | Stop the clock, dashboard, image or stream. The screen keeps its last picture. |
+| `ssp clear` | Stop the clock, dashboard, image or stream and blank the screen. |
+| `--for <TIME>` | With `show`, `clock`, `dashboard`, `web`, `layout`, `stop` and `clear`: show it for this long, then what was shown before. Seconds, or `90s`, `10m`, `2h`; up to a week. Not with `--persist`. |
+
+### Screen
+
+| Command | Description |
+|---|---|
+| `ssp brightness <0-100>` | Set the backlight in percent. |
+| `ssp on` | Switch the screen on. |
+| `ssp off` | Switch the screen off. What is being shown keeps running. |
+| `ssp notify <TEXT>` | Show a message over the screen for a while, then go back to what was shown. |
+| `  --detail <TEXT>` | A smaller line under the message. |
+| `  --for <TIME>` | How long it stays: seconds, or `90s`, `5m`, `2h`; up to a day, default 10 seconds. |
+| `  --sticky` | Keep it until dismissed or replaced. |
+| `  --style banner\|full` | Draw it across the bottom third (default) or the whole panel. |
+| `  --color <COLOR>` | `red`, `orange`, `yellow`, `green`, `blue` (default), `gray` or `#rrggbb`. |
+| `  --wake` | Switch the screen on if it is off, and off again after. |
+| `  --stdin` | Read the message from standard input: text, or the JSON of a Claude Code hook. |
+| `  --if-running` | Do nothing, without an error, when the daemon is not running or no display is connected (for hooks). |
+| `ssp notify --dismiss` | End the notification. |
+| `ssp claude-code hooks` | Show the Claude Code hooks that notify on the display. |
+| `  --install` | Add them to Claude Code's `settings.json` (the old file is kept as `settings.json.bak`). |
+| `  --uninstall` | Remove the hooks added by `--install`. |
+| `ssp schedule` | Show the last and the next entries of the schedule (`[[schedule]]` in the config). |
+| `ssp schedule pause` | Stop changing the screen at set times, until `resume`. |
+| `ssp schedule resume` | Apply what the schedule says now, and change at set times again. |
+
+### Autostart
+
+| Command | macOS | Linux | Windows |
+|---|---|---|---|
+| `ssp service install` | LaunchAgent `~/Library/LaunchAgents/dev.sub-screen-player.ssp.plist` | systemd user unit `~/.config/systemd/user/sub-screen-player.service` | Value `sub-screen-player` in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
+| `ssp service uninstall` | Stops the daemon and removes the agent | Stops the daemon and removes the unit | Removes the entry (a running daemon keeps running until you sign out) |
+| `ssp service status` | Installed? Running? | Installed? Active? | Installed? |
+| Restart (e.g. after updating `ssp`) | `ssp service install` again | `systemctl --user restart sub-screen-player` | End `ssp.exe` in Task Manager, then `ssp service install` |
+| Logs | `~/Library/Logs/sub-screen-player.log` | `journalctl --user -u sub-screen-player` | `%LOCALAPPDATA%\sub-screen-player\ssp.log` |
+
+`install` starts the daemon right away. The entry records the path of the `ssp` executable and
+of the config file at the time of installing, so run `install` again after moving either. After
+editing the config, `ssp config reload` applies it without a restart (on Linux,
+`systemctl --user reload sub-screen-player` runs it).
+
+### Config file
+
+| Command | Description |
+|---|---|
+| `ssp config path` | Print the path of the config file. |
+| `ssp config init` | Write a commented config file with the default values. |
+| `  --force` | Overwrite an existing file. |
+| `ssp config show` | Print the effective configuration (defaults plus the file). |
+| `ssp config reload` | Have the running daemon read the config file again and apply it, then wait until it answers with it. |
+
+`ssp config reload` refuses a file with errors (the message says what is wrong), and the daemon
+keeps running as it was. With a good file, the daemon stops its screens and the API for a moment
+and starts again with the new config, in the same process: every setting applies, including
+`listen` and `token`. The displays are not blanked. A display showing what you told it to
+(`ssp show`, `ssp web`, `ssp clock`, `ssp layout` and the like) shows it again: the clock, the
+dashboard, web pages and layouts with the new settings and the options you gave, pictures and
+videos as they were. The others show what the new config says at start (`[startup]`, or the
+schedule); with a schedule, its next change takes over as before. Metrics are kept;
+notifications, a paused schedule and WebSocket streams are not. If the new config
+cannot start (for example, the new `listen` address is taken), the daemon goes back to the one
+before and `ssp config reload` says why.
+
+`ssp config reload` finds the daemon as other commands do, through the config file. After
+changing `listen` or `token` there, give the running daemon's old ones:
+`ssp --url http://127.0.0.1:7920 --token OLD config reload`. It then follows the daemon to its
+new address.
+
+#### Config file location
+
+| OS | Path |
+|---|---|
+| macOS | `~/Library/Application Support/sub-screen-player/config.toml` |
+| Linux | `~/.config/sub-screen-player/config.toml` (`$XDG_CONFIG_HOME` is respected) |
+| Windows | `%APPDATA%\sub-screen-player\config\config.toml` |
+
+The file is optional; without it the defaults apply. `ssp config init` shows every setting
+with a comment. The daemon reads the file when it starts.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | The command failed, e.g. the daemon is not running or refused the request. The reason is printed after `error:`. |
+| `2` | Invalid command line arguments |
+
+## Troubleshooting
+
+1. **`ssp selftest`** checks the whole path from USB to the screen without the daemon. Stop the
+   daemon, run it, and include its output when you [report a problem](../CONTRIBUTING.md).
+2. **`ssp devices`**
+   - "The daemon is not running" and your display is listed as plugged in: start the daemon
+     with `ssp serve` or `ssp service install`.
+   - Your display is not listed at all: check the cable. On Linux, install the udev rule (see
+     the [README](../README.md#install)) and replug the display.
+3. **The daemon log says "cannot open ... display"**: another program is using the display,
+   for example the vendor's app or a second `ssp serve`. Close it; the daemon retries every
+   10 seconds.
+4. **"cannot listen on 127.0.0.1:7920 (is the daemon already running?)"**: a daemon is already
+   running (`ssp service status`), or another program uses the port. Use `--listen` with
+   another port, and `--url` for the other commands.
+5. **`ssp status`** shows whether frames reach the display. A growing `shown` count means
+   they do. Many `dropped` frames are normal when a program streams faster than the display
+   can take.
+6. **More detail**: run `SSP_LOG=debug ssp serve` and watch the log.
+7. **The D92 shows an old picture after the daemon stopped**: the D92 restarts about 8 seconds
+   after the daemon stops talking to it and then shows the last *stored* image. Store the one
+   you want with `ssp show --persist`, or set `on_exit = "save-last"`.
+8. **The display does not react to anything**: unplug it and plug it in again. The daemon
+   picks it up again on its own.

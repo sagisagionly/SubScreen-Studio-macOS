@@ -1,0 +1,1335 @@
+//! The API driven through its router, as clients use it, with a fake display attached. Nothing
+//! here touches USB devices, the network or the user's files.
+
+use std::io::Cursor;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use axum::Router;
+use axum::body::Body;
+use axum::http::{HeaderName, Request, StatusCode, header};
+use image::codecs::gif::{GifEncoder, Repeat};
+use image::{Delay, Frame as ImageFrame, ImageFormat, Rgba, RgbaImage};
+use serde::de::DeserializeOwned;
+use ssp_core::Registry;
+use ssp_core::testing::{Call, CallLog, FakeDisplay};
+use tokio::sync::{mpsc, watch};
+use tower::ServiceExt;
+
+use super::types::{
+    DisplayView, ErrorBody, Health, MetricView, Reloaded, ScheduleView, SystemView,
+};
+use super::{AppState, router};
+use crate::config::{Config, RotationItem, ScheduleEntry, StartupConfig, StartupShow};
+use crate::manager::{Manager, Timer};
+use crate::metrics::Metrics;
+use crate::reload::Reloader;
+use crate::schedule::Schedule;
+use crate::sources::Content;
+use crate::sources::video::{self, Videos};
+use crate::web::page_token::PageToken;
+
+/// The id of the fake display.
+const DISPLAY: &str = "fake-0001";
+const TOKEN: &str = "0123456789abcdef";
+/// The start of an MP4 file: enough for the API to take a body for a video.
+const MP4_HEAD: &[u8] = b"\0\0\0\x20ftypisom\0\0\x02\0isomiso2avc1mp41";
+
+/// The API of a daemon with one fake display. Uploaded videos go to a fresh temporary folder,
+/// removed when the test ends.
+struct Api {
+    router: Router,
+    manager: Arc<Manager>,
+    log: CallLog,
+    dir: PathBuf,
+    /// Ends changes for a while, as in the daemon.
+    timer: Option<Timer>,
+    /// Kept so that open WebSocket streams do not see the daemon stopping.
+    _shutdown: watch::Sender<bool>,
+}
+
+impl Api {
+    fn new(config: Config) -> Self {
+        Self::with(config, |state, _| state)
+    }
+
+    /// An API whose state `adjust` changes, given the metrics.
+    fn with(config: Config, adjust: impl FnOnce(AppState, &Metrics) -> AppState) -> Self {
+        // Tests run in parallel in one process.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("ssp-api-{}-{n}", std::process::id()));
+        let videos = Videos::new(config.video.ffmpeg.clone(), dir.join("uploads")).unwrap();
+        let metrics = Metrics::default();
+        let manager = Arc::new(Manager::new(Registry::new(), &config, metrics.clone()).unwrap());
+        // As the daemon does: the schedule decides what a display shows when it connects.
+        if let Some(schedule) = Schedule::new(&config, &metrics).unwrap() {
+            manager.set_schedule(schedule);
+        }
+        let (display, log) = FakeDisplay::new();
+        manager.attach(Box::new(display), c"fake".to_owned());
+        let (stopping, shutdown) = watch::channel(false);
+        let state = AppState::new(manager.clone(), &config, metrics.clone(), videos, shutdown);
+        let state = adjust(state, &metrics);
+        Self {
+            router: router(state),
+            timer: Some(manager.spawn_timer()),
+            manager,
+            log,
+            dir,
+            _shutdown: stopping,
+        }
+    }
+
+    /// The status and body of the answer to `request`.
+    async fn send(&self, request: Request<Body>) -> (StatusCode, String) {
+        let response = self.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// `GET uri`, which must succeed.
+    async fn get<T: DeserializeOwned>(&self, uri: &str) -> T {
+        let (status, body) = self.send(request("GET", uri)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    /// What the fake display shows.
+    async fn content(&self) -> String {
+        let display: DisplayView = self.get(&format!("/api/v1/displays/{DISPLAY}")).await;
+        display.content
+    }
+
+    /// The videos the daemon keeps.
+    fn uploads(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(self.dir.join("uploads"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+}
+
+impl Drop for Api {
+    fn drop(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            timer.stop();
+        }
+        self.manager.shutdown();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The default config, except that the display starts with nothing on it, so whatever the fake
+/// display gets comes from the requests of the test.
+fn config() -> Config {
+    Config {
+        startup: StartupConfig {
+            show: StartupShow::Nothing,
+            ..StartupConfig::default()
+        },
+        ..Config::default()
+    }
+}
+
+fn request(method: &str, uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn json_request(method: &str, uri: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
+/// A POST of `body` without a content type, as files are sent.
+fn post(uri: &str, body: impl Into<Body>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .body(body.into())
+        .unwrap()
+}
+
+fn with_header(mut request: Request<Body>, name: HeaderName, value: &str) -> Request<Body> {
+    request.headers_mut().insert(name, value.parse().unwrap());
+    request
+}
+
+/// The message of an error answer of the API.
+fn error(body: &str) -> String {
+    serde_json::from_str::<ErrorBody>(body)
+        .unwrap_or_else(|e| panic!("not an error body ({e}): {body}"))
+        .error
+}
+
+/// A small PNG file.
+fn png() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    RgbaImage::from_pixel(8, 4, Rgba([255, 0, 0, 255]))
+        .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+        .unwrap();
+    bytes
+}
+
+/// A GIF of two frames, red then blue.
+fn gif() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = GifEncoder::new(&mut bytes);
+        encoder.set_repeat(Repeat::Infinite).unwrap();
+        for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
+            let image = RgbaImage::from_pixel(8, 4, Rgba(color));
+            let delay = Delay::from_numer_denom_ms(100, 1);
+            encoder
+                .encode_frame(ImageFrame::from_parts(image, 0, 0, delay))
+                .unwrap();
+        }
+    }
+    bytes
+}
+
+fn wait_until(mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[tokio::test]
+async fn reports_health() {
+    let api = Api::new(config());
+    let health: Health = api.get("/api/v1/health").await;
+    assert_eq!(health.status, "ok");
+    assert_eq!(health.version, env!("CARGO_PKG_VERSION"));
+    // The registry is empty: the fake display was attached by hand.
+    assert_eq!(health.drivers, Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn lists_displays() {
+    let api = Api::new(config());
+    let displays: Vec<DisplayView> = api.get("/api/v1/displays").await;
+    assert_eq!(displays.len(), 1);
+    let display = &displays[0];
+    assert_eq!(display.id, DISPLAY);
+    assert_eq!(
+        (display.driver.as_str(), display.serial.as_str()),
+        ("fake", "0001")
+    );
+    assert_eq!((display.width, display.height), (1920, 462));
+    assert_eq!(display.content, "nothing");
+    assert!(display.connected);
+    assert!(display.capabilities.brightness);
+    assert!(display.stats.is_some());
+
+    let default: DisplayView = api.get("/api/v1/displays/default").await;
+    assert_eq!(default.id, DISPLAY);
+    let (status, body) = api.send(request("GET", "/api/v1/displays/nope")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(error(&body).contains("nope"), "{body}");
+}
+
+#[tokio::test]
+async fn keeps_metrics() {
+    let api = Api::new(config());
+    for (uri, body) in [
+        (
+            "/api/v1/metrics/ci",
+            r#"{"label": "CI", "value": 3, "unit": "failed", "detail": "main"}"#,
+        ),
+        ("/api/v1/metrics/ci", r#"{"value": 1}"#),
+        ("/api/v1/metrics/build", r#"{"text": "passing"}"#),
+    ] {
+        let (status, body) = api.send(json_request("PUT", uri, body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    }
+
+    let ci: MetricView = api.get("/api/v1/metrics/ci").await;
+    assert_eq!((ci.id.as_str(), ci.label.as_str()), ("ci", "CI"));
+    assert_eq!((ci.value, ci.text.as_deref()), (Some(1.0), None));
+    assert_eq!((ci.unit.as_str(), ci.detail.as_str()), ("failed", "main"));
+    assert_eq!(ci.history, [3.0, 1.0]);
+    assert_eq!((ci.max, ci.ttl, ci.stale), (None, 300, false));
+    assert!(
+        ci.updated.parse::<jiff::Timestamp>().is_ok(),
+        "{}",
+        ci.updated
+    );
+
+    // Sorted by id; the label defaults to the id.
+    let all: Vec<MetricView> = api.get("/api/v1/metrics").await;
+    let ids: Vec<&str> = all.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["build", "ci"]);
+    assert_eq!(all[0].label, "build");
+    assert_eq!(
+        (all[0].value, all[0].text.as_deref()),
+        (None, Some("passing"))
+    );
+
+    let (status, _) = api.send(request("DELETE", "/api/v1/metrics/ci")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for method in ["DELETE", "GET"] {
+        let (status, body) = api.send(request(method, "/api/v1/metrics/ci")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method}");
+        assert!(error(&body).contains("no metric"), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn rejects_bad_metrics() {
+    let api = Api::new(config());
+    for (uri, body, message) in [
+        ("/api/v1/metrics/CI", r#"{"value": 1}"#, "invalid metric id"),
+        (
+            "/api/v1/metrics/ci",
+            r#"{"value": 1, "text": "up"}"#,
+            "either value or text",
+        ),
+        (
+            "/api/v1/metrics/ci",
+            r#"{"label": "CI"}"#,
+            "does not exist yet",
+        ),
+        ("/api/v1/metrics/ci", r#"{"value": 1, "ttl": 0}"#, "ttl"),
+    ] {
+        let (status, body) = api.send(json_request("PUT", uri, body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(error(&body).contains(message), "{body}");
+    }
+
+    // Bodies that are not a metric update are refused by axum's `Json` extractor; the answer is
+    // still a JSON error.
+    let typo = json_request("PUT", "/api/v1/metrics/ci", r#"{"vaule": 1}"#);
+    let (status, body) = api.send(typo).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(error(&body).contains("unknown field `vaule`"), "{body}");
+    let cut = json_request("PUT", "/api/v1/metrics/ci", r#"{"value": 1"#);
+    let (status, body) = api.send(cut).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!error(&body).is_empty(), "{body}");
+
+    let all: Vec<MetricView> = api.get("/api/v1/metrics").await;
+    assert!(all.is_empty());
+}
+
+#[tokio::test]
+async fn shows_images_and_animations() {
+    let api = Api::new(config());
+    let uri = "/api/v1/displays/fake-0001/image";
+    let (status, body) = api.send(post(uri, png())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(api.content().await, "image");
+    wait_until(|| api.log.calls().iter().any(|c| matches!(c, Call::Show(_))));
+
+    let (status, body) = api.send(post(uri, gif())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(api.content().await, "animation");
+
+    // `persist` also stores the picture on the device.
+    let saved = || api.log.calls().iter().any(|c| matches!(c, Call::Save(_)));
+    assert!(!saved());
+    let uri = "/api/v1/displays/fake-0001/image?fit=cover&persist=true";
+    let (status, body) = api.send(post(uri, png())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(saved());
+    assert_eq!(api.content().await, "image");
+}
+
+#[tokio::test]
+async fn rejects_bad_images() {
+    let api = Api::new(config());
+    let garbage = post("/api/v1/displays/fake-0001/image", "not an image");
+    let (status, body) = api.send(garbage).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error(&body).contains("cannot decode image"), "{body}");
+
+    let (status, body) = api.send(post("/api/v1/displays/nope/image", png())).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(error(&body).contains("nope"), "{body}");
+
+    // Refused by axum's `Query` extractor, as a JSON error too.
+    let sideways = post("/api/v1/displays/fake-0001/image?fit=sideways", png());
+    let (status, body) = api.send(sideways).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error(&body).contains("fit"), "{body}");
+    assert_eq!(api.content().await, "nothing");
+}
+
+#[tokio::test]
+async fn refuses_videos_without_ffmpeg_and_to_persist() {
+    let mut config = config();
+    config.video.ffmpeg = Some(std::env::temp_dir().join("ssp-api-no-ffmpeg"));
+    let api = Api::new(config);
+    let uri = "/api/v1/displays/fake-0001/image";
+    let (status, body) = api.send(post(uri, MP4_HEAD)).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert!(error(&body).contains("does not exist"), "{body}");
+
+    let uri = "/api/v1/displays/fake-0001/image?persist=true";
+    let (status, body) = api.send(post(uri, MP4_HEAD)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error(&body).contains("persist"), "{body}");
+    assert!(api.uploads().is_empty());
+    assert_eq!(api.content().await, "nothing");
+}
+
+#[tokio::test]
+async fn plays_an_uploaded_video_until_replaced() {
+    let Ok(ffmpeg) = video::find_ffmpeg(None) else {
+        eprintln!("skipped: ffmpeg is not installed");
+        return;
+    };
+    let api = Api::new(config());
+    let clip = api.dir.join("clip.mp4");
+    let made = std::process::Command::new(ffmpeg)
+        .args(["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi"])
+        .args([
+            "-i",
+            "testsrc2=size=64x36:rate=10",
+            "-t",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&clip)
+        .status()
+        .unwrap();
+    assert!(made.success());
+
+    let uri = "/api/v1/displays/fake-0001/image";
+    let (status, body) = api.send(post(uri, std::fs::read(&clip).unwrap())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(api.content().await, "video");
+    assert_eq!(api.uploads().len(), 1);
+
+    // The file is deleted once nothing plays it.
+    let stop = request("POST", "/api/v1/displays/fake-0001/stop");
+    assert_eq!(api.send(stop).await.0, StatusCode::NO_CONTENT);
+    assert!(api.uploads().is_empty());
+
+    // A file ffmpeg cannot play is refused, and deleted too.
+    let mut broken = MP4_HEAD.to_vec();
+    broken.resize(4096, 0);
+    let (status, body) = api.send(post(uri, broken)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error(&body).contains("ffmpeg cannot play"), "{body}");
+    assert!(api.uploads().is_empty());
+    assert_eq!(api.content().await, "nothing");
+}
+
+#[tokio::test]
+async fn refuses_web_pages_it_cannot_show() {
+    let mut config = config();
+    // A browser that is not there, so nothing is started or downloaded.
+    config.web.chrome = Some(std::env::temp_dir().join("ssp-api-no-chrome"));
+    let api = Api::new(config);
+    let uri = "/api/v1/displays/fake-0001/web";
+    let script = json_request("POST", uri, r#"{"url": "javascript:alert(1)"}"#);
+    let (status, body) = api.send(script).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error(&body).contains("only http, https and file"), "{body}");
+
+    let page = json_request("POST", uri, r#"{"url": "https://example.com/"}"#);
+    let (status, body) = api.send(page).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(error(&body).contains("does not exist"), "{body}");
+    assert_eq!(api.content().await, "nothing");
+}
+
+#[tokio::test]
+async fn shows_a_dashboard() {
+    let api = Api::new(config());
+    let uri = "/api/v1/displays/fake-0001/dashboard";
+    let widgets = r#"{"widgets": ["clock", "metric:ci", "claude-code"]}"#;
+    let (status, body) = api.send(json_request("POST", uri, widgets)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(api.content().await, "dashboard");
+
+    // The body is optional.
+    let (status, body) = api.send(request("POST", uri)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // An unknown widget is refused.
+    let gpu = json_request("POST", uri, r#"{"widgets": ["gpu"]}"#);
+    let (status, body) = api.send(gpu).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error(&body).contains("unknown widget"), "{body}");
+    let green = json_request("POST", uri, r#"{"accent": "green"}"#);
+    let (status, body) = api.send(green).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error(&body).contains("#RRGGBB"), "{body}");
+
+    // A body is read without `Content-Type: application/json` too, and misspelled fields are
+    // refused rather than ignored.
+    let (status, body) = api.send(post(uri, r#"{"widgets": ["gpu"]}"#)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error(&body).contains("unknown widget"), "{body}");
+    let (status, body) = api.send(post(uri, r#"{"widgets": ["cpu"]}"#)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let typo = json_request("POST", uri, r#"{"widget": ["cpu"]}"#);
+    let (status, body) = api.send(typo).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error(&body).contains("unknown field `widget`"), "{body}");
+
+    // Unknown paths answer with a JSON error as well.
+    let (status, body) = api.send(request("GET", "/api/v1/nothing-here")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!error(&body).is_empty(), "{body}");
+}
+
+#[tokio::test]
+async fn shows_a_clock_and_stops() {
+    let api = Api::new(config());
+    let uri = "/api/v1/displays/fake-0001/clock";
+    let no_seconds = json_request("POST", uri, r#"{"seconds": false}"#);
+    let (status, body) = api.send(no_seconds).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(api.content().await, "clock");
+    let red = json_request("POST", uri, r#"{"color": "red"}"#);
+    let (status, body) = api.send(red).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error(&body).contains("#RRGGBB"), "{body}");
+
+    let stop = request("POST", "/api/v1/displays/fake-0001/stop");
+    assert_eq!(api.send(stop).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(api.content().await, "nothing");
+}
+
+#[tokio::test]
+async fn controls_the_display() {
+    let api = Api::new(config());
+    for (uri, body) in [
+        (
+            "/api/v1/displays/fake-0001/brightness",
+            r#"{"percent": 50}"#,
+        ),
+        ("/api/v1/displays/fake-0001/power", r#"{"on": false}"#),
+        ("/api/v1/displays/fake-0001/power", r#"{"on": true}"#),
+    ] {
+        let (status, body) = api.send(json_request("POST", uri, body)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    }
+    let clear = request("POST", "/api/v1/displays/fake-0001/clear");
+    assert_eq!(api.send(clear).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        api.log.take(),
+        [Call::Brightness(50), Call::Sleep, Call::Wake, Call::Clear]
+    );
+
+    let uri = "/api/v1/displays/fake-0001/brightness";
+    let (status, body) = api
+        .send(json_request("POST", uri, r#"{"percent": 101}"#))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error(&body).contains("over 100"), "{body}");
+    assert!(api.log.take().is_empty());
+}
+
+#[tokio::test]
+async fn needs_the_token_when_one_is_set() {
+    let api = Api::new(Config {
+        token: Some(TOKEN.into()),
+        ..config()
+    });
+    let health = || request("GET", "/api/v1/health");
+    let bearer = format!("Bearer {TOKEN}");
+
+    let (status, body) = api.send(health()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(error(&body).contains("token"), "{body}");
+    let wrong = with_header(health(), header::AUTHORIZATION, "Bearer 0123456789abcdeX");
+    assert_eq!(api.send(wrong).await.0, StatusCode::UNAUTHORIZED);
+    let right = with_header(health(), header::AUTHORIZATION, &bearer);
+    assert_eq!(api.send(right).await.0, StatusCode::OK);
+    // For browser WebSockets, which cannot set headers.
+    let query = request("GET", &format!("/api/v1/health?token={TOKEN}"));
+    assert_eq!(api.send(query).await.0, StatusCode::OK);
+    // The token replaces the origin check: a page that has it may use the API.
+    let page = with_header(health(), header::ORIGIN, "https://evil.example");
+    let page = with_header(page, header::AUTHORIZATION, &bearer);
+    assert_eq!(api.send(page).await.0, StatusCode::OK);
+
+    // A refused request does not reach its handler.
+    let unsigned = json_request("PUT", "/api/v1/metrics/ci", r#"{"value": 1}"#);
+    assert_eq!(api.send(unsigned).await.0, StatusCode::UNAUTHORIZED);
+    let check = request("GET", "/api/v1/metrics/ci");
+    let check = with_header(check, header::AUTHORIZATION, &bearer);
+    assert_eq!(api.send(check).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn refuses_web_pages_without_a_token() {
+    let api = Api::new(config());
+    for (name, value, expected) in [
+        (
+            header::ORIGIN,
+            "https://evil.example",
+            StatusCode::FORBIDDEN,
+        ),
+        (header::ORIGIN, "null", StatusCode::FORBIDDEN),
+        // DNS rebinding: a page's own host name made to point at the daemon.
+        (header::HOST, "evil.example:7920", StatusCode::FORBIDDEN),
+        (header::ORIGIN, "http://localhost:5173", StatusCode::OK),
+        (header::HOST, "127.0.0.1:7920", StatusCode::OK),
+    ] {
+        let health = with_header(request("GET", "/api/v1/health"), name.clone(), value);
+        let (status, body) = api.send(health).await;
+        assert_eq!(status, expected, "{name}: {value}: {body}");
+    }
+
+    // A refused request does not reach its handler.
+    let put = json_request("PUT", "/api/v1/metrics/ci", r#"{"value": 1}"#);
+    let evil = with_header(put, header::ORIGIN, "https://evil.example");
+    let (status, body) = api.send(evil).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(error(&body).contains("web pages"), "{body}");
+    let (status, _) = api.send(request("GET", "/api/v1/metrics/ci")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn reports_system_figures() {
+    let api = Api::new(config());
+    let system: SystemView = api.get("/api/v1/system").await;
+    assert!(system.cpu_count > 0);
+    assert!(system.memory_total > 0);
+    assert!((0.0..=100.0).contains(&system.cpu_percent));
+}
+
+#[tokio::test]
+async fn pages_read_with_their_token() {
+    for daemon_token in [None, Some(TOKEN.to_owned())] {
+        let api = Api::new(Config {
+            token: daemon_token.clone(),
+            ..config()
+        });
+        let token = PageToken::issue();
+        let bearer = format!("Bearer {}", token.as_str());
+        let from_page = |request: Request<Body>, origin: &str| {
+            let request = with_header(request, header::ORIGIN, origin);
+            with_header(request, header::AUTHORIZATION, &bearer)
+        };
+        let put = json_request("PUT", "/api/v1/metrics/ci", r#"{"value": 1}"#);
+        let put = match &daemon_token {
+            Some(t) => with_header(put, header::AUTHORIZATION, &format!("Bearer {t}")),
+            None => put,
+        };
+        assert!(api.send(put).await.0.is_success());
+
+        // Reads, from any origin, with CORS headers for it.
+        for (path, origin) in [
+            ("/api/v1/metrics/ci", "https://example.com"),
+            ("/api/v1/metrics", "null"),
+            ("/api/v1/displays", "http://192.168.1.5:8000"),
+            ("/api/v1/system", "null"),
+        ] {
+            let response = api
+                .router
+                .clone()
+                .oneshot(from_page(request("GET", path), origin))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let allowed = response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN);
+            assert_eq!(allowed.unwrap(), origin, "{path}");
+        }
+
+        // Nothing else, and the request does not reach its handler.
+        for request in [
+            json_request("PUT", "/api/v1/metrics/ci", r#"{"value": 2}"#),
+            post(&format!("/api/v1/displays/{DISPLAY}/clear"), ""),
+            request("GET", "/api/v1/web/chrome"),
+        ] {
+            let (status, body) = api.send(from_page(request, "null")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(error(&body).contains("page token"), "{body}");
+        }
+        assert!(api.log.take().is_empty());
+
+        // A token of a page no longer shown is just a wrong token.
+        drop(token);
+        let (status, _) = api
+            .send(from_page(
+                request("GET", "/api/v1/metrics"),
+                "https://example.com",
+            ))
+            .await;
+        let refused = if daemon_token.is_some() {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        assert_eq!(status, refused);
+    }
+}
+
+#[tokio::test]
+async fn answers_preflights_for_pages() {
+    let api = Api::new(Config {
+        token: Some(TOKEN.into()),
+        ..config()
+    });
+    let preflight = |path: &str| {
+        let request = request("OPTIONS", path);
+        let request = with_header(request, header::ORIGIN, "https://example.com");
+        let request = with_header(request, header::ACCESS_CONTROL_REQUEST_METHOD, "GET");
+        let request = with_header(
+            request,
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "authorization",
+        );
+        with_header(
+            request,
+            HeaderName::from_static("access-control-request-private-network"),
+            "true",
+        )
+    };
+    let response = api
+        .router
+        .clone()
+        .oneshot(preflight("/api/v1/metrics/claude-code"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let headers = response.headers();
+    assert_eq!(
+        headers[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://example.com"
+    );
+    assert_eq!(headers[header::ACCESS_CONTROL_ALLOW_METHODS], "GET");
+    assert_eq!(
+        headers[header::ACCESS_CONTROL_ALLOW_HEADERS],
+        "authorization"
+    );
+    assert_eq!(headers["access-control-allow-private-network"], "true");
+    // Only for what pages may read.
+    let (status, _) = api
+        .send(preflight(&format!("/api/v1/displays/{DISPLAY}/clear")))
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn shows_and_dismisses_notifications() {
+    let api = Api::new(config());
+    let notify =
+        |body: &str| json_request("POST", &format!("/api/v1/displays/{DISPLAY}/notify"), body);
+    let shows = |log: &CallLog| {
+        log.take()
+            .iter()
+            .filter(|c| matches!(c, Call::Show(_) | Call::ShowPart { .. }))
+            .count()
+    };
+
+    // Over nothing: drawn on black at once, and black again when it ends.
+    let (status, body) = api
+        .send(notify(
+            r#"{"text": "CI failed", "detail": "main", "seconds": 4, "color": "red"}"#,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    wait_until(|| shows(&api.log) > 0);
+    let display: DisplayView = api.get(&format!("/api/v1/displays/{DISPLAY}")).await;
+    let shown = display.notification.expect("a notification");
+    assert_eq!(
+        (shown.text.as_str(), shown.color.as_str(), shown.sticky),
+        ("CI failed", "#dc2626", false)
+    );
+    // Rounded up, and less the time it took to ask.
+    assert!(
+        matches!(shown.seconds_left, Some(1..=4)),
+        "{:?}",
+        shown.seconds_left
+    );
+    wait_until(|| shows(&api.log) > 0);
+    let display: DisplayView = api.get(&format!("/api/v1/displays/{DISPLAY}")).await;
+    assert_eq!(display.notification, None);
+
+    // A sticky one stays until dismissed.
+    let (status, _) = api
+        .send(notify(r#"{"text": "Waiting", "sticky": true}"#))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let display: DisplayView = api.get(&format!("/api/v1/displays/{DISPLAY}")).await;
+    let shown = display.notification.expect("a notification");
+    assert!(shown.sticky);
+    assert_eq!(shown.seconds_left, None);
+    let dismiss = request("DELETE", &format!("/api/v1/displays/{DISPLAY}/notify"));
+    assert_eq!(api.send(dismiss).await.0, StatusCode::NO_CONTENT);
+    let display: DisplayView = api.get(&format!("/api/v1/displays/{DISPLAY}")).await;
+    assert_eq!(display.notification, None);
+
+    // Clearing the screen ends it too.
+    api.send(notify(r#"{"text": "Waiting", "sticky": true}"#))
+        .await;
+    let clear = post(&format!("/api/v1/displays/{DISPLAY}/clear"), "");
+    assert_eq!(api.send(clear).await.0, StatusCode::NO_CONTENT);
+    let display: DisplayView = api.get(&format!("/api/v1/displays/{DISPLAY}")).await;
+    assert_eq!(display.notification, None);
+}
+
+#[tokio::test]
+async fn refuses_bad_notifications() {
+    let api = Api::new(config());
+    for (body, expected) in [
+        (r#"{"text": ""}"#, "empty"),
+        (r#"{"text": "a", "seconds": 0}"#, "at least 1"),
+        (r#"{"text": "a", "seconds": 5, "sticky": true}"#, "either"),
+        (r#"{"text": "a", "color": "purple"}"#, "not a color"),
+        (r#"{"text": "a", "style": "popup"}"#, "style"),
+        (r#"{"text": "a", "colour": "red"}"#, "colour"),
+    ] {
+        let request = json_request("POST", &format!("/api/v1/displays/{DISPLAY}/notify"), body);
+        let (status, answer) = api.send(request).await;
+        assert!(status.is_client_error(), "{body}: {status}");
+        assert!(error(&answer).contains(expected), "{body}: {answer}");
+    }
+    let long = format!(r#"{{"text": "{}"}}"#, "x".repeat(81));
+    let request = json_request("POST", &format!("/api/v1/displays/{DISPLAY}/notify"), &long);
+    assert_eq!(api.send(request).await.0, StatusCode::BAD_REQUEST);
+    let unknown = json_request("POST", "/api/v1/displays/nope/notify", r#"{"text": "a"}"#);
+    assert_eq!(api.send(unknown).await.0, StatusCode::NOT_FOUND);
+    assert!(api.log.take().is_empty());
+}
+
+/// A schedule entry at midnight every day, so it has always happened in the last day.
+fn midnight(show: StartupShow, brightness: u8) -> ScheduleEntry {
+    ScheduleEntry {
+        at: "00:00".into(),
+        days: Vec::new(),
+        display: None,
+        show: Some(show),
+        image: None,
+        url: None,
+        reload: None,
+        fit: None,
+        layout: None,
+        brightness: Some(brightness),
+        power: None,
+    }
+}
+
+#[tokio::test]
+async fn follows_the_schedule() {
+    let api = Api::new(Config {
+        schedule: vec![midnight(StartupShow::Dashboard, 30)],
+        ..config()
+    });
+    // A display that connects shows what the schedule says, at its brightness.
+    assert_eq!(api.content().await, "dashboard");
+    wait_until(|| api.log.calls().contains(&Call::Brightness(30)));
+
+    let schedule: ScheduleView = api.get("/api/v1/schedule").await;
+    assert_eq!((schedule.entries, schedule.paused), (1, false));
+    let last = schedule.last.expect("midnight has passed");
+    assert!(
+        last.at.ends_with(&last.at[19..]) && last.at.contains("T00:00:00"),
+        "{}",
+        last.at
+    );
+    assert_eq!(last.does, ["show dashboard, brightness 30"]);
+    assert!(schedule.next.is_some());
+
+    // A change by hand stays until the next entry, or until the schedule is resumed.
+    let (status, _) = api
+        .send(post(&format!("/api/v1/displays/{DISPLAY}/clock"), ""))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(api.content().await, "clock");
+    let pause = post("/api/v1/schedule/pause", "");
+    assert_eq!(api.send(pause).await.0, StatusCode::NO_CONTENT);
+    let schedule: ScheduleView = api.get("/api/v1/schedule").await;
+    assert!(schedule.paused);
+    let resume = post("/api/v1/schedule/resume", "");
+    assert_eq!(api.send(resume).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(api.content().await, "dashboard");
+}
+
+/// Serves the API on a free local port, for tests with a real WebSocket.
+async fn serve(api: &Api) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = api.router.clone();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    address
+}
+
+type Socket = tungstenite::WebSocket<std::net::TcpStream>;
+
+/// Opens a stream to the fake display and sends it a frame (on a thread of its own: the
+/// handshake waits for the server, which runs on the test's thread).
+async fn open_stream(address: std::net::SocketAddr) -> Socket {
+    tokio::task::spawn_blocking(move || {
+        let tcp = std::net::TcpStream::connect(address).unwrap();
+        let url = format!("ws://{address}/api/v1/displays/{DISPLAY}/stream");
+        let (mut socket, _) = tungstenite::client(url, tcp).unwrap();
+        socket.send(tungstenite::Message::binary(png())).unwrap();
+        socket.flush().unwrap();
+        socket
+    })
+    .await
+    .unwrap()
+}
+
+/// Ends a stream as its sender, and waits until the daemon has seen that.
+async fn close_stream(mut socket: Socket) {
+    tokio::task::spawn_blocking(move || {
+        socket.close(None).unwrap();
+        while socket.read().is_ok() {}
+    })
+    .await
+    .unwrap();
+}
+
+/// Opens a stream into the stream zone of the fake display, or answers the HTTP status it was
+/// refused with.
+async fn open_zone_stream(address: std::net::SocketAddr) -> Result<Socket, u16> {
+    tokio::task::spawn_blocking(move || {
+        let tcp = std::net::TcpStream::connect(address).unwrap();
+        let url = format!("ws://{address}/api/v1/displays/{DISPLAY}/stream?zone=true");
+        match tungstenite::client(url, tcp) {
+            Ok((socket, _)) => Ok(socket),
+            Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(answer))) => {
+                Err(answer.status().as_u16())
+            }
+            Err(err) => panic!("{err}"),
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn streams_into_the_stream_zone_of_a_layout() {
+    let api = Api::new(config());
+    let address = serve(&api).await;
+    assert_eq!(open_zone_stream(address).await.err(), Some(409));
+
+    let layout = json_request(
+        "POST",
+        &format!("/api/v1/displays/{DISPLAY}/layout"),
+        r#"{"zones": [{"show": "clock", "width": 0.5}, {"show": "stream"}]}"#,
+    );
+    let (status, answer) = api.send(layout).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let mut socket = open_zone_stream(address).await.unwrap();
+    let mut socket = tokio::task::spawn_blocking(move || {
+        // A picture is fitted into the zone; raw pixels must be its size.
+        socket.send(tungstenite::Message::binary(png())).unwrap();
+        socket.flush().unwrap();
+        socket
+    })
+    .await
+    .unwrap();
+    assert_eq!(api.content().await, "layout");
+    let raw = format!("ws://{address}/api/v1/displays/{DISPLAY}/stream?zone=true&format=rgb");
+    let wrong_size = tokio::task::spawn_blocking(move || {
+        let tcp = std::net::TcpStream::connect(address).unwrap();
+        let (mut raw, _) = tungstenite::client(raw, tcp).unwrap();
+        raw.send(tungstenite::Message::binary(vec![0; 30])).unwrap();
+        raw.read().unwrap().into_text().unwrap().to_string()
+    })
+    .await
+    .unwrap();
+    assert!(wrong_size.contains("the zone is 960x462"), "{wrong_size}");
+
+    // Showing something else ends the stream.
+    let (status, _) = api
+        .send(post(&format!("/api/v1/displays/{DISPLAY}/clock"), ""))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let closed = tokio::task::spawn_blocking(move || {
+        let _ = socket.send(tungstenite::Message::binary(png()));
+        let _ = socket.flush();
+        loop {
+            match socket.read() {
+                Ok(tungstenite::Message::Close(frame)) => {
+                    break frame.map(|f| u16::from(f.code));
+                }
+                Ok(_) => continue,
+                Err(_) => break None,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(closed, Some(4000));
+    assert_eq!(api.content().await, "clock");
+}
+
+#[tokio::test]
+async fn answers_the_close_of_a_stream() {
+    let api = Api::new(config());
+    let address = serve(&api).await;
+    let mut socket = open_stream(address).await;
+    let end = tokio::task::spawn_blocking(move || {
+        socket.close(None).unwrap();
+        loop {
+            if let Err(err) = socket.read() {
+                break err;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(end, tungstenite::Error::ConnectionClosed),
+        "{end:?}"
+    );
+}
+
+#[tokio::test]
+async fn goes_back_to_the_schedule_when_a_stream_ends() {
+    let api = Api::new(Config {
+        schedule: vec![midnight(StartupShow::Dashboard, 30)],
+        ..config()
+    });
+    assert_eq!(api.content().await, "dashboard");
+    let address = serve(&api).await;
+
+    // A sender that comes back at once keeps the display.
+    let first = open_stream(address).await;
+    assert_eq!(api.content().await, "stream");
+    close_stream(first).await;
+    let second = open_stream(address).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(api.content().await, "stream");
+
+    // Once it is gone, the schedule takes over again after a moment.
+    close_stream(second).await;
+    assert_eq!(api.content().await, "stream");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(api.content().await, "dashboard");
+}
+
+#[tokio::test]
+async fn keeps_the_last_frame_of_a_stream_without_a_schedule() {
+    let api = Api::new(config());
+    let address = serve(&api).await;
+    let socket = open_stream(address).await;
+    close_stream(socket).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(api.content().await, "stream");
+}
+
+#[tokio::test]
+async fn reports_no_schedule() {
+    let api = Api::new(config());
+    let schedule: ScheduleView = api.get("/api/v1/schedule").await;
+    assert_eq!(
+        (schedule.entries, schedule.last, schedule.next),
+        (0, None, None)
+    );
+    let (status, body) = api.send(post("/api/v1/schedule/pause", "")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(error(&body).contains("[[schedule]]"), "{body}");
+}
+
+#[tokio::test]
+async fn rotates_between_screens() {
+    let mut config = config();
+    config.startup.show = StartupShow::Rotation;
+    config.rotation.show = vec![
+        RotationItem::Name(StartupShow::Clock),
+        RotationItem::Name(StartupShow::Dashboard),
+    ];
+    let api = Api::new(config);
+    assert_eq!(api.content().await, "rotation");
+    wait_until(|| !api.log.calls().is_empty());
+}
+
+#[tokio::test]
+async fn shows_a_layout() {
+    let api = Api::new(config());
+    std::fs::create_dir_all(&api.dir).unwrap();
+    let picture = api.dir.join("red.png");
+    std::fs::write(&picture, png()).unwrap();
+    let body = serde_json::json!({
+        "zones": [
+            { "show": "clock", "width": 0.3 },
+            { "show": "image", "image": picture, "fit": "cover" },
+            { "show": "metric:ci", "width": 480 },
+        ],
+        "gap": 16,
+    });
+    let request = json_request(
+        "POST",
+        &format!("/api/v1/displays/{DISPLAY}/layout"),
+        &body.to_string(),
+    );
+    let (status, answer) = api.send(request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    assert_eq!(api.content().await, "layout");
+    wait_until(|| api.log.calls().iter().any(|c| matches!(c, Call::Show(_))));
+}
+
+#[tokio::test]
+async fn shows_a_layout_by_name() {
+    let named: Config =
+        toml::from_str("[layouts.work]\nzones = [{ show = \"clock\" }, { show = \"cpu\" }]")
+            .unwrap();
+    let api = Api::new(Config {
+        layouts: named.layouts,
+        ..config()
+    });
+    let layout = |query: &str| post(&format!("/api/v1/displays/{DISPLAY}/layout{query}"), "");
+    let (status, answer) = api.send(layout("?name=work")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    assert_eq!(api.content().await, "layout");
+
+    let (status, answer) = api.send(layout("?name=play")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    let (status, answer) = api.send(layout("")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert!(error(&answer).contains("?name="), "{answer}");
+    let both = json_request(
+        "POST",
+        &format!("/api/v1/displays/{DISPLAY}/layout?name=work"),
+        r#"{"zones": [{"show": "clock"}]}"#,
+    );
+    let (status, answer) = api.send(both).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert!(error(&answer).contains("not both"), "{answer}");
+}
+
+#[tokio::test]
+async fn refuses_bad_layouts() {
+    let api = Api::new(config());
+    for (body, expected) in [
+        (r#"{"zones": []}"#, "no zones"),
+        (r#"{"zones": [{"show": "weather"}]}"#, "unknown zone"),
+        (r#"{"zones": [{"show": "image"}]}"#, "needs image"),
+        (
+            r#"{"zones": [{"show": "clock", "url": "https://a.b"}]}"#,
+            "image and url",
+        ),
+        (
+            r#"{"zones": [{"show": "web", "url": "https://a.b"}, {"show": "web", "url": "https://c.d"}]}"#,
+            "one web zone",
+        ),
+        (
+            r#"{"zones": [{"show": "clock", "width": 0}]}"#,
+            "more than 0",
+        ),
+        (
+            r#"{"zones": [{"show": "image", "image": "/nonexistent.png"}]}"#,
+            "cannot read",
+        ),
+        (
+            r#"{"zones": [{"show": "clock"}], "background": "black"}"#,
+            "color",
+        ),
+    ] {
+        let request = json_request("POST", &format!("/api/v1/displays/{DISPLAY}/layout"), body);
+        let (status, answer) = api.send(request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {answer}");
+        assert!(error(&answer).contains(expected), "{body}: {answer}");
+    }
+    assert_eq!(api.content().await, "nothing");
+}
+
+/// Reads a config, as the daemon does from its file.
+type ReadConfig = fn() -> anyhow::Result<Config>;
+
+/// An API whose `POST /reload` reads the config with `read`; the configs it hands the daemon to
+/// serve again with arrive in the receiver.
+fn reloading_api(token: Option<String>, read: ReadConfig) -> (Api, mpsc::Receiver<Config>) {
+    let (restart, restarts) = mpsc::channel(1);
+    let api = Api::with(Config { token, ..config() }, |state, metrics| {
+        let reloader = Reloader::new(Arc::new(read), metrics.clone(), restart);
+        state.with_reload(Some(reloader), Arc::default())
+    });
+    (api, restarts)
+}
+
+#[tokio::test]
+async fn reload_hands_the_new_config_to_the_daemon() {
+    let (api, mut restarts) = reloading_api(None, || {
+        Ok(Config {
+            listen: "127.0.0.1:7931".parse().unwrap(),
+            ..config()
+        })
+    });
+    let health: Health = api.get("/api/v1/health").await;
+    assert!(health.started.is_some());
+    assert_eq!(health.reload_error, None);
+
+    let (status, body) = api.send(request("POST", "/api/v1/reload")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let reloaded: Reloaded = serde_json::from_str(&body).unwrap();
+    assert_eq!(reloaded.listen, "127.0.0.1:7931");
+    // Until the daemon has taken it, another reload is refused.
+    let (status, body) = api.send(request("POST", "/api/v1/reload")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error(&body).contains("already reloading"), "{body}");
+    assert_eq!(restarts.try_recv().unwrap().listen.port(), 7931);
+}
+
+#[tokio::test]
+async fn reload_refuses_a_config_the_daemon_cannot_start_with() {
+    let cases: [(ReadConfig, &str); 3] = [
+        (
+            || anyhow::bail!("TOML parse error at line 3"),
+            "TOML parse error",
+        ),
+        (
+            || {
+                let mut config = config();
+                config.drivers.enable = vec!["nope".into()];
+                Ok(config)
+            },
+            "[drivers]",
+        ),
+        (
+            || {
+                let mut config = config();
+                config.startup.show = StartupShow::Image;
+                config.startup.image = Some("/nonexistent/picture.png".into());
+                Ok(config)
+            },
+            "startup",
+        ),
+    ];
+    for (read, expected) in cases {
+        let (api, mut restarts) = reloading_api(None, read);
+        let (status, body) = api.send(request("POST", "/api/v1/reload")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(error(&body).contains(expected), "{expected}: {body}");
+        assert!(restarts.try_recv().is_err(), "{expected}");
+    }
+}
+
+#[tokio::test]
+async fn reload_needs_the_daemons_token() {
+    let (api, mut restarts) = reloading_api(Some(TOKEN.into()), || Ok(config()));
+    let page = PageToken::issue();
+    for bearer in [None, Some(page.as_str())] {
+        let mut request = request("POST", "/api/v1/reload");
+        if let Some(bearer) = bearer {
+            request = with_header(request, header::AUTHORIZATION, &format!("Bearer {bearer}"));
+        }
+        let (status, body) = api.send(request).await;
+        assert!(status.is_client_error(), "{status}: {body}");
+    }
+    assert!(restarts.try_recv().is_err());
+    let request = with_header(
+        request("POST", "/api/v1/reload"),
+        header::AUTHORIZATION,
+        &format!("Bearer {TOKEN}"),
+    );
+    assert_eq!(api.send(request).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn reload_needs_a_config_to_read() {
+    let api = Api::new(config());
+    let (status, _) = api.send(request("POST", "/api/v1/reload")).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn chosen_content_is_built_again_with_the_new_config() {
+    // A "browser" that is a plain file: the page is accepted, and starting it fails without
+    // touching the network.
+    let fake_chrome =
+        std::env::temp_dir().join(format!("ssp-api-fake-chrome-{}", std::process::id()));
+    std::fs::write(&fake_chrome, b"not a browser").unwrap();
+    let mut config = config();
+    config.web.chrome = Some(fake_chrome.clone());
+    let api = Api::new(config);
+    let post = |path: &str, body: &str| {
+        json_request("POST", &format!("/api/v1/displays/{DISPLAY}/{path}"), body)
+    };
+    let mut new = self::config();
+    new.clock.color = "#00FF00".into();
+    new.clock.seconds = false;
+    new.listen = "127.0.0.1:7931".parse().unwrap();
+    let rebuilt = || {
+        let chosen = api.manager.chosen();
+        assert_eq!(chosen.len(), 1);
+        chosen[0]
+            .1
+            .chosen()
+            .content(&new, &Metrics::default())
+            .unwrap()
+    };
+
+    // The clock keeps what the request set, over the new `[clock]`.
+    let (status, body) = api.send(post("clock", r##"{"color": "#FF0000"}"##)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    match rebuilt() {
+        Content::Clock(clock) => {
+            assert_eq!(clock.color, "#FF0000");
+            assert!(!clock.seconds);
+        }
+        other => panic!("{}", other.kind()),
+    }
+
+    // A web page talks to the daemon at its new address.
+    let (status, body) = api
+        .send(post("web", r#"{"url": "https://example.com/"}"#))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    match rebuilt() {
+        Content::Web { web, .. } => {
+            assert_eq!(web.api(), Some("http://127.0.0.1:7931/api/v1"));
+        }
+        other => panic!("{}", other.kind()),
+    }
+
+    // Stopped stays stopped.
+    let (status, _) = api.send(post("stop", "")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(rebuilt().kind(), "nothing");
+    let _ = std::fs::remove_file(fake_chrome);
+}
+
+#[tokio::test]
+async fn a_change_for_a_while_goes_back() {
+    let api = Api::new(config());
+    let me = format!("/api/v1/displays/{DISPLAY}");
+    let uri = |path: &str| format!("{me}/{path}");
+    let (status, body) = api.send(post(&uri("clock?for=2"), "")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let display: DisplayView = api.get(&me).await;
+    assert_eq!(display.content, "clock");
+    assert_eq!(display.content_seconds_left, Some(2));
+    let started = Instant::now();
+    while api.content().await != "nothing" {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "still showing the clock"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let display: DisplayView = api.get(&me).await;
+    assert_eq!(display.content_seconds_left, None);
+
+    for (path, body) in [
+        ("clock?for=0", Body::empty()),
+        ("stop?for=604801", Body::empty()),
+    ] {
+        let (status, answer) = api.send(post(&uri(path), body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {answer}");
+        assert!(error(&answer).contains("for must be"), "{answer}");
+    }
+    let (status, answer) = api
+        .send(post(&uri("image?persist=true&for=5"), png()))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(api.content().await, "nothing");
+}

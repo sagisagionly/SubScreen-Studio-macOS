@@ -1,0 +1,78 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/drivers/d92",
+    "crates/drivers/dq288",
+    "crates/server",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.10.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+authors = ["sub-screen-player contributors"]
+
+[workspace.dependencies]
+# Crates of this workspace
+ssp-core = { path = "crates/core", version = "0.10.0" }
+ssp-driver-d92 = { path = "crates/drivers/d92", version = "0.10.0" }
+ssp-driver-dq288 = { path = "crates/drivers/dq288", version = "0.10.0" }
+ssp-server = { path = "crates/server", version = "0.10.0" }
+
+# Devices and images
+# Linux uses the pure-Rust hidraw backend; macOS and Windows build the C hidapi library, whose
+# Windows backend (unlike `windows-native`) can read input reports.
+hidapi = { version = "2.6.7", default-features = false, features = ["linux-native-basic-udev"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+jpeg-encoder = { version = "0.7.1", features = ["simd"] }
+ab_glyph = "0.2.32"
+# System fonts for characters the built-in font lacks (e.g. Japanese)
+fontdb = "0.24.0"
+# CPU, memory, network and disk figures for the dashboard
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk", "network"] }
+jiff = "0.2.38"
+# Finding replies in Claude Code's logs without parsing every line
+memchr = "2.8.3"
+# Web screens: the DevTools protocol of headless Chrome, and unpacking its download
+tungstenite = { version = "0.29.0", default-features = false, features = ["handshake"] }
+base64 = "0.22.1"
+getrandom = "0.3.4"
+url = "2.5.8"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+# Errors and logging
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# Daemon
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "fs", "io-util"] }
+futures-util = { version = "0.3.34", default-features = false }
+axum = { version = "0.8.9", features = ["ws"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+toml = "1.1.6"
+
+# CLI
+clap = { version = "4.6.7", features = ["derive", "env"] }
+ureq = { version = "3.4.2", default-features = false, features = ["json"] }
+directories = "6.0.0"
+winreg = "0.56.0"
+
+# Tests: driving the API router without a server
+tower = { version = "0.5.3", features = ["util"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

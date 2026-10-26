@@ -1,0 +1,14 @@
+# Cloudflare (Workers static assets) only; GitHub Pages ignores this file.
+# The installers are read by `curl | sh` and `irm | iex`: plain text, always the newest.
+/install.sh
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: no-cache
+/install.ps1
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: no-cache
+# Read by `ssp status` (at most once a day per computer); always the newest.
+/latest.json
+  Cache-Control: no-cache
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin

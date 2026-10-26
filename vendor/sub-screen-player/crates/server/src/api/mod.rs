@@ -1,0 +1,903 @@
+//! HTTP + WebSocket API under `/api/v1`. See `docs/api.md`.
+
+mod auth;
+mod stream;
+#[cfg(test)]
+mod tests;
+pub mod types;
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::Router;
+use axum::body::{Body, BodyDataStream};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post, put};
+use axum::{Json, middleware};
+use futures_util::StreamExt;
+use ssp_core::{Fit, Frame};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::watch;
+
+use crate::config::{ClockConfig, Config, DashboardConfig, LayoutConfig};
+use crate::manager::{Chosen, DisplayState, LookupError, Manager, Rebuild};
+use crate::metrics::{Metric, Metrics};
+use crate::notify::{self, Notification};
+use crate::reload::Reloader;
+use crate::sources::stats::Stats;
+use crate::sources::video::{self, MAX_VIDEO_BYTES, VideoFile, Videos};
+use crate::sources::web::WebPage;
+use crate::sources::{Clock, Content, Picture};
+use crate::web::Web;
+use types::{
+    BrightnessRequest, CapabilitiesView, ChromeView, ClockRequest, DashboardRequest, DisplayView,
+    ErrorBody, ForQuery, Health, ImageQuery, LayoutQuery, MetricUpdate, MetricView,
+    NotificationView, NotifyRequest, PowerRequest, Reloaded, ScheduleEventView, ScheduleView,
+    StatsView, SystemView, WebRequest,
+};
+
+/// Largest request body accepted for images.
+const MAX_IMAGE_BYTES: usize = 64 << 20;
+
+/// Longest change for a while (`for`): a week.
+const MAX_FOR_SECONDS: u64 = 7 * 24 * 3600;
+
+/// The time of a change for a while, from the query's `for`.
+fn for_time(seconds: Option<u64>) -> Result<Option<Duration>, ApiError> {
+    match seconds {
+        None => Ok(None),
+        Some(s @ 1..=MAX_FOR_SECONDS) => Ok(Some(Duration::from_secs(s))),
+        Some(_) => Err(ApiError::bad_request(format!(
+            "for must be 1 to {MAX_FOR_SECONDS} seconds (a week)"
+        ))),
+    }
+}
+
+/// Shared state of all handlers.
+#[derive(Clone)]
+pub struct AppState {
+    manager: Arc<Manager>,
+    /// For contents built from requests (layouts) with the daemon's settings.
+    config: Arc<Config>,
+    token: Option<Arc<str>>,
+    clock: ClockConfig,
+    dashboard: DashboardConfig,
+    metrics: Metrics,
+    videos: Arc<Videos>,
+    web: Web,
+    /// Measures `GET /system`.
+    system: Arc<Mutex<Stats>>,
+    shutdown: watch::Receiver<bool>,
+    /// When this state was made: the daemon started, or applied its config again.
+    started: jiff::Timestamp,
+    /// Reads the config again for `POST /reload`, if the daemon knows where it came from.
+    reload: Option<Reloader>,
+    /// Why the last reload did not take.
+    reload_error: Arc<Mutex<Option<String>>>,
+}
+
+impl AppState {
+    /// The API of `manager` with the token, defaults and browser settings of `config`.
+    /// `shutdown` turns `true` when the daemon is stopping; open streams then close.
+    pub fn new(
+        manager: Arc<Manager>,
+        config: &Config,
+        metrics: Metrics,
+        videos: Videos,
+        shutdown: watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            manager,
+            config: Arc::new(config.clone()),
+            token: config.token.clone().map(Into::into),
+            clock: config.clock.clone(),
+            dashboard: config.dashboard.clone(),
+            metrics,
+            videos: Arc::new(videos),
+            web: Web::new(&config.web).with_api(config.listen),
+            system: Arc::new(Mutex::new(Stats::new())),
+            shutdown,
+            started: jiff::Timestamp::now(),
+            reload: None,
+            reload_error: Arc::default(),
+        }
+    }
+
+    /// Lets `POST /reload` apply the config again with `reload`; `error` tells why the last
+    /// reload did not take.
+    pub fn with_reload(
+        mut self,
+        reload: Option<Reloader>,
+        error: Arc<Mutex<Option<String>>>,
+    ) -> Self {
+        self.reload = reload;
+        self.reload_error = error;
+        self
+    }
+}
+
+/// All routes.
+pub fn router(state: AppState) -> Router {
+    let api = Router::new()
+        .route("/health", get(health))
+        .route("/reload", post(reload))
+        .route("/displays", get(list))
+        .route("/displays/{id}", get(one))
+        .route("/displays/{id}/image", post(show_image))
+        .route("/displays/{id}/brightness", post(brightness))
+        .route("/displays/{id}/power", post(power))
+        .route("/displays/{id}/clear", post(clear))
+        .route("/displays/{id}/clock", post(clock))
+        .route("/displays/{id}/dashboard", post(dashboard))
+        .route("/displays/{id}/stop", post(stop))
+        .route("/displays/{id}/stream", get(stream::stream))
+        .route("/displays/{id}/web", post(show_web))
+        .route("/displays/{id}/layout", post(show_layout))
+        .route(
+            "/displays/{id}/notify",
+            post(show_notification).delete(dismiss_notification),
+        )
+        .route("/web/chrome", get(chrome_status).post(install_chrome))
+        .route("/system", get(system))
+        .route("/schedule", get(schedule))
+        .route("/schedule/pause", post(pause_schedule))
+        .route("/schedule/resume", post(resume_schedule))
+        .route("/metrics", get(list_metrics))
+        .route(
+            "/metrics/{id}",
+            put(set_metric).get(get_metric).delete(delete_metric),
+        );
+    Router::new()
+        .nest("/api/v1", api)
+        .layer(middleware::from_fn_with_state(state.clone(), auth::guard))
+        .layer(middleware::map_response(json_errors))
+        .with_state(state)
+}
+
+/// Turns the error answers axum makes itself (malformed JSON, a bad query, an unknown path),
+/// which are plain text, into the `{"error": "..."}` body of every other error.
+async fn json_errors(response: Response) -> Response {
+    let status = response.status();
+    let json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+    if !(status.is_client_error() || status.is_server_error()) || json {
+        return response;
+    }
+    let message = match axum::body::to_bytes(response.into_body(), 64 << 10).await {
+        Ok(text) if !text.is_empty() => String::from_utf8_lossy(&text).into_owned(),
+        _ => status.canonical_reason().unwrap_or("error").to_owned(),
+    };
+    ApiError::new(status, message).into_response()
+}
+
+/// An optional JSON body, read whatever its `Content-Type` says (scripts often send none). An
+/// empty body is `None`.
+fn optional_json<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<Option<T>, ApiError> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    serde_json::from_slice(body)
+        .map(Some)
+        .map_err(|e| ApiError::bad_request(format!("invalid request: {e}")))
+}
+
+/// An error response with a JSON body.
+#[derive(Debug)]
+pub struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, message)
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, message)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(ErrorBody {
+                error: self.message,
+            }),
+        )
+            .into_response()
+    }
+}
+
+impl From<ssp_core::Error> for ApiError {
+    fn from(err: ssp_core::Error) -> Self {
+        use ssp_core::Error as E;
+        let status = match &err {
+            E::InvalidArgument(_) | E::Image(_) => StatusCode::BAD_REQUEST,
+            E::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
+            E::Transport(_) | E::Disconnected | E::Closed => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        Self::new(status, err.to_string())
+    }
+}
+
+impl From<LookupError> for ApiError {
+    fn from(err: LookupError) -> Self {
+        let status = match err {
+            LookupError::NotFound(_) => StatusCode::NOT_FOUND,
+            LookupError::NotConnected(_) => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        Self::new(status, err.to_string())
+    }
+}
+
+/// Runs blocking device work off the async threads.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(work).await.map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("request failed: {e}"),
+        )
+    })?
+}
+
+fn view(state: DisplayState) -> DisplayView {
+    let caps = &state.info.capabilities;
+    DisplayView {
+        driver: state.info.driver.to_string(),
+        model: state.info.model.clone(),
+        serial: state.info.serial.clone(),
+        firmware: state.info.firmware.clone(),
+        connected: state.connected,
+        width: state.info.panel.width,
+        height: state.info.panel.height,
+        content: state.content.to_string(),
+        capabilities: CapabilitiesView {
+            live_frames: caps.live_frames,
+            saved_frames: caps.saved_frames,
+            brightness: caps.brightness,
+            power: caps.power,
+            clear: caps.clear,
+            max_fps: caps.max_fps,
+        },
+        stats: state.stats.map(|s| StatsView {
+            submitted: s.submitted,
+            shown: s.shown,
+            partial: s.partial,
+            dropped: s.dropped,
+            duplicates: s.duplicates,
+            last_encode_ms: s.last_encode.as_secs_f64() * 1000.0,
+            last_send_ms: s.last_send.as_secs_f64() * 1000.0,
+            last_bytes: s.last_bytes,
+            quality: s.quality,
+        }),
+        notification: state.notification.map(|shown| {
+            let [r, g, b] = shown.notification.color;
+            NotificationView {
+                text: shown.notification.text,
+                detail: shown.notification.detail,
+                style: shown.notification.style,
+                color: format!("#{r:02x}{g:02x}{b:02x}"),
+                // Rounded up, so a notification about to end does not say 0.
+                seconds_left: shown
+                    .left
+                    .map(|d| d.as_secs() + u64::from(d.subsec_nanos() > 0)),
+                sticky: shown.left.is_none(),
+            }
+        }),
+        content_seconds_left: state.content_until.map(|until| {
+            let left = Duration::try_from(until.duration_since(jiff::Timestamp::now()))
+                .unwrap_or_default();
+            // Rounded up, so a change about to end does not say 0.
+            left.as_secs() + u64::from(left.subsec_nanos() > 0)
+        }),
+        id: state.id,
+    }
+}
+
+async fn schedule(State(app): State<AppState>) -> Json<ScheduleView> {
+    let Some(schedule) = app.manager.schedule() else {
+        return Json(ScheduleView {
+            entries: 0,
+            paused: false,
+            last: None,
+            next: None,
+        });
+    };
+    let status = schedule.status(&jiff::Zoned::now());
+    let event = |e: crate::schedule::Event| ScheduleEventView {
+        at: e.at.strftime("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+        entries: e.entries,
+        does: e.does,
+    };
+    Json(ScheduleView {
+        entries: status.entries,
+        paused: status.paused,
+        last: status.last.map(event),
+        next: status.next.map(event),
+    })
+}
+
+fn no_schedule() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "the config has no [[schedule]] entries",
+    )
+}
+
+async fn pause_schedule(State(app): State<AppState>) -> Result<StatusCode, ApiError> {
+    app.manager.schedule().ok_or_else(no_schedule)?.pause();
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn resume_schedule(State(app): State<AppState>) -> Result<StatusCode, ApiError> {
+    let schedule = app.manager.schedule().ok_or_else(no_schedule)?;
+    blocking(move || {
+        schedule.resume(&app.manager);
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+async fn show_layout(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<LayoutQuery>,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, ApiError> {
+    let time = for_time(query.seconds)?;
+    let zones: Option<LayoutConfig> = optional_json(&body)?;
+    // Again with the new config: a named layout as the config now says.
+    let rebuild: Rebuild = match (query.name, zones) {
+        (Some(name), None) => {
+            if !app.config.layouts.contains_key(&name) {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    format!("no layout {name:?} in [layouts] of the config"),
+                ));
+            }
+            Arc::new(move |config: &Config, metrics: &Metrics| {
+                Content::named_layout(&name, config, metrics)
+            })
+        }
+        (None, Some(layout)) => Arc::new(move |config: &Config, metrics: &Metrics| {
+            Content::layout(&layout, config, metrics)
+        }),
+        (Some(_), Some(_)) => {
+            return Err(ApiError::bad_request(
+                "give either zones in the body or a name, not both",
+            ));
+        }
+        (None, None) => {
+            return Err(ApiError::bad_request(
+                "give the zones in the body, or the name of a layout of [layouts] (?name=)",
+            ));
+        }
+    };
+    blocking(move || {
+        // Reads image and video files, so off the async threads.
+        let content = rebuild(&app.config, &app.metrics).map_err(ApiError::bad_request)?;
+        app.manager
+            .choose_for(&id, content, Chosen::Rebuild(rebuild), time)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+async fn show_notification(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<NotifyRequest>,
+) -> Result<StatusCode, ApiError> {
+    if request.sticky && request.seconds.is_some() {
+        return Err(ApiError::bad_request(
+            "give either seconds or sticky, not both",
+        ));
+    }
+    let color_name = request.color.as_deref().unwrap_or(notify::DEFAULT_COLOR);
+    let color = notify::parse_color(color_name).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "{color_name:?} is not a color: use red, orange, yellow, green, blue, gray or #RRGGBB"
+        ))
+    })?;
+    let notification = Notification {
+        text: request.text,
+        detail: request.detail.filter(|d| !d.trim().is_empty()),
+        style: request.style.unwrap_or_default(),
+        color,
+        duration: (!request.sticky)
+            .then(|| Duration::from_secs(request.seconds.unwrap_or(notify::DEFAULT_SECONDS))),
+        wake: request.wake,
+    };
+    notification.validate().map_err(ApiError::bad_request)?;
+    blocking(move || {
+        app.manager.notify(&id, notification)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+async fn dismiss_notification(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    blocking(move || {
+        app.manager.dismiss(&id)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+async fn health(State(app): State<AppState>) -> Json<Health> {
+    Json(Health {
+        status: "ok".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        drivers: Some(
+            app.manager
+                .drivers()
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        ),
+        started: Some(app.started.to_string()),
+        reload_error: app
+            .reload_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone(),
+    })
+}
+
+/// Reads the config file again and, if the daemon can start with it, serves again with it. The
+/// answer comes before the daemon stops; it is back once `GET /health` shows a new `started`.
+async fn reload(State(app): State<AppState>) -> Result<Json<Reloaded>, ApiError> {
+    let reloader = app.reload.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "this daemon was not started from a config file it can read again",
+        )
+    })?;
+    let listen = reloader
+        .reload()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    Ok(Json(Reloaded {
+        listen: listen.to_string(),
+    }))
+}
+
+async fn list(State(app): State<AppState>) -> Json<Vec<DisplayView>> {
+    Json(app.manager.displays().into_iter().map(view).collect())
+}
+
+async fn one(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<DisplayView>, ApiError> {
+    Ok(Json(view(app.manager.display(&id)?)))
+}
+
+async fn show_image(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ImageQuery>,
+    body: Body,
+) -> Result<StatusCode, ApiError> {
+    let fit = query.fit.unwrap_or_default().into();
+    let time = for_time(query.seconds)?;
+    if query.persist && time.is_some() {
+        return Err(ApiError::bad_request(
+            "persist stores the image for good; it does not go with for",
+        ));
+    }
+    // The first bytes tell images from videos; videos go to a file instead of memory.
+    let mut chunks = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while bytes.len() < 256 {
+        match chunks.next().await {
+            Some(chunk) => bytes.extend_from_slice(&chunk.map_err(unreadable)?),
+            None => break,
+        }
+    }
+    if video::is_video(&bytes) && image::guess_format(&bytes).is_err() {
+        return show_video(app, id, query, fit, time, bytes, chunks).await;
+    }
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(unreadable)?;
+        if bytes.len() + chunk.len() > MAX_IMAGE_BYTES {
+            return Err(too_large(MAX_IMAGE_BYTES as u64, "an image"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    blocking(move || {
+        let picture = Picture::decode(&bytes).map_err(ApiError::bad_request)?;
+        if query.persist {
+            // The device holds one picture: an animation stores its first frame.
+            let device = app.manager.device(&id)?;
+            let panel = device.presenter.info().panel;
+            app.manager.set_content(&id, Content::Nothing)?;
+            device
+                .presenter
+                .save(Frame::fit(picture.first(), panel.width, panel.height, fit))?;
+        }
+        let content = picture.into_content(fit);
+        app.manager
+            .choose_for(&id, content.clone(), Chosen::same(content), time)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+/// Receives a video whose first bytes are `head` into a file and plays it.
+async fn show_video(
+    app: AppState,
+    id: String,
+    query: ImageQuery,
+    fit: Fit,
+    time: Option<Duration>,
+    head: Vec<u8>,
+    mut chunks: BodyDataStream,
+) -> Result<StatusCode, ApiError> {
+    let refused = if query.persist {
+        Some(ApiError::bad_request(
+            "a video cannot be stored on the display (persist); store a picture instead",
+        ))
+    } else {
+        app.videos
+            .ffmpeg()
+            .map_err(|e| ApiError::new(StatusCode::NOT_IMPLEMENTED, e))
+            .err()
+    };
+    if let Some(err) = refused {
+        // Read the rest first: a client still sending would see a broken connection instead.
+        while let Some(Ok(_)) = chunks.next().await {}
+        return Err(err);
+    }
+    let ffmpeg = app.videos.ffmpeg().map_err(ApiError::bad_request)?;
+    let path = app.videos.file();
+    if let Err(err) = receive(&path, head, &mut chunks).await {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(err);
+    }
+    blocking(move || {
+        let video = VideoFile::open(path, ffmpeg, true).map_err(ApiError::bad_request)?;
+        let content = Content::Video {
+            video: Arc::new(video),
+            fit,
+        };
+        app.manager
+            .choose_for(&id, content.clone(), Chosen::same(content), time)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+/// Writes `head` and the rest of the body to `path`.
+async fn receive(
+    path: &std::path::Path,
+    head: Vec<u8>,
+    chunks: &mut BodyDataStream,
+) -> Result<(), ApiError> {
+    let failed = |e: std::io::Error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot store the video: {e}"),
+        )
+    };
+    let mut file = tokio::fs::File::create(path).await.map_err(failed)?;
+    let mut size = head.len() as u64;
+    file.write_all(&head).await.map_err(failed)?;
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(unreadable)?;
+        size += chunk.len() as u64;
+        if size > MAX_VIDEO_BYTES {
+            return Err(too_large(MAX_VIDEO_BYTES, "a video"));
+        }
+        file.write_all(&chunk).await.map_err(failed)?;
+    }
+    file.flush().await.map_err(failed)
+}
+
+fn unreadable(err: axum::Error) -> ApiError {
+    ApiError::bad_request(format!("cannot read the request body: {err}"))
+}
+
+fn too_large(limit: u64, what: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!("{what} may be at most {} MiB", limit >> 20),
+    )
+}
+
+async fn show_web(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ForQuery>,
+    Json(request): Json<WebRequest>,
+) -> Result<StatusCode, ApiError> {
+    let page = WebPage::new(&request.url, request.reload).map_err(ApiError::bad_request)?;
+    let time = for_time(query.seconds)?;
+    blocking(move || {
+        // Find (or download, if allowed) the browser now, so a missing one is reported here
+        // rather than only on the display.
+        app.web
+            .ensure()
+            .map_err(|e| ApiError::new(StatusCode::CONFLICT, e))?;
+        let content = Content::Web {
+            page: page.clone(),
+            web: app.web.clone(),
+        };
+        // Again with the new browser settings and API address.
+        let rebuild = move |config: &Config, _: &Metrics| {
+            Ok(Content::Web {
+                page: page.clone(),
+                web: Web::new(&config.web).with_api(config.listen),
+            })
+        };
+        app.manager
+            .choose_for(&id, content, Chosen::Rebuild(Arc::new(rebuild)), time)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+async fn chrome_status(State(app): State<AppState>) -> Result<Json<ChromeView>, ApiError> {
+    blocking(move || Ok(Json(app.web.status()))).await
+}
+
+async fn install_chrome(State(app): State<AppState>) -> Result<Json<ChromeView>, ApiError> {
+    blocking(move || {
+        app.web
+            .install()
+            .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e))?;
+        Ok(Json(app.web.status()))
+    })
+    .await
+}
+
+async fn brightness(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<BrightnessRequest>,
+) -> Result<StatusCode, ApiError> {
+    blocking(move || {
+        app.manager
+            .device(&id)?
+            .presenter
+            .set_brightness(request.percent)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+async fn power(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<PowerRequest>,
+) -> Result<StatusCode, ApiError> {
+    blocking(move || {
+        let device = app.manager.device(&id)?;
+        if request.on {
+            device.presenter.wake()
+        } else {
+            device.presenter.sleep()
+        }?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+async fn clear(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ForQuery>,
+) -> Result<StatusCode, ApiError> {
+    let time = for_time(query.seconds)?;
+    blocking(move || {
+        let device = app.manager.device(&id)?;
+        app.manager
+            .choose_for(&id, Content::Nothing, Chosen::same(Content::Nothing), time)?;
+        device.clear()?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+async fn clock(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ForQuery>,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, ApiError> {
+    let time = for_time(query.seconds)?;
+    let request: ClockRequest = optional_json(&body)?.unwrap_or_default();
+    let config = clock_with(&app.clock, &request).map_err(ApiError::bad_request)?;
+    // Again over the new `[clock]`.
+    let rebuild =
+        move |config: &Config, _: &Metrics| clock_with(&config.clock, &request).map(Content::Clock);
+    blocking(move || {
+        app.manager.choose_for(
+            &id,
+            Content::Clock(config),
+            Chosen::Rebuild(Arc::new(rebuild)),
+            time,
+        )?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+/// The clock settings `base` with what `request` changes.
+fn clock_with(base: &ClockConfig, request: &ClockRequest) -> Result<ClockConfig, String> {
+    let mut config = base.clone();
+    if let Some(seconds) = request.seconds {
+        config.seconds = seconds;
+        config.time_format = None;
+    }
+    config.time_format = request.time_format.clone().or(config.time_format);
+    config.date_format = request.date_format.clone().unwrap_or(config.date_format);
+    config.weekdays = request.weekdays.clone().unwrap_or(config.weekdays);
+    config.color = request.color.clone().unwrap_or(config.color);
+    config.background = request.background.clone().unwrap_or(config.background);
+    for color in [&config.color, &config.background] {
+        if crate::config::parse_color(color).is_none() {
+            return Err(format!("{color:?} is not a #RRGGBB color"));
+        }
+    }
+    Clock::validate(&config)?;
+    Ok(config)
+}
+
+async fn dashboard(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ForQuery>,
+    body: axum::body::Bytes,
+) -> Result<StatusCode, ApiError> {
+    let time = for_time(query.seconds)?;
+    let request: DashboardRequest = optional_json(&body)?.unwrap_or_default();
+    let config = dashboard_with(&app.dashboard, &request).map_err(ApiError::bad_request)?;
+    let clock = app.clock.clone();
+    let metrics = app.metrics.clone();
+    // Again over the new `[dashboard]` and `[clock]`.
+    let rebuild = move |config: &Config, metrics: &Metrics| {
+        dashboard_with(&config.dashboard, &request)
+            .map(|d| Content::Dashboard(d, config.clock.clone(), metrics.clone()))
+    };
+    blocking(move || {
+        app.manager.choose_for(
+            &id,
+            Content::Dashboard(config, clock, metrics),
+            Chosen::Rebuild(Arc::new(rebuild)),
+            time,
+        )?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+/// The dashboard settings `base` with what `request` changes.
+fn dashboard_with(
+    base: &DashboardConfig,
+    request: &DashboardRequest,
+) -> Result<DashboardConfig, String> {
+    let mut config = base.clone();
+    config.widgets = request.widgets.clone().unwrap_or(config.widgets);
+    config.color = request.color.clone().unwrap_or(config.color);
+    config.accent = request.accent.clone().unwrap_or(config.accent);
+    config.background = request.background.clone().unwrap_or(config.background);
+    config.validate()?;
+    Ok(config)
+}
+
+async fn stop(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ForQuery>,
+) -> Result<StatusCode, ApiError> {
+    let time = for_time(query.seconds)?;
+    blocking(move || {
+        app.manager
+            .choose_for(&id, Content::Nothing, Chosen::same(Content::Nothing), time)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+async fn system(State(app): State<AppState>) -> Result<Json<SystemView>, ApiError> {
+    let now = tokio::task::spawn_blocking(move || {
+        let mut stats = app.system.lock().unwrap_or_else(|p| p.into_inner());
+        stats.refresh_or_wait();
+        stats.now.clone()
+    })
+    .await
+    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(SystemView {
+        cpu_percent: now.cpu_percent,
+        cpu_count: now.cpu_count,
+        load: now.load,
+        memory_used: now.memory_used,
+        memory_total: now.memory_total,
+        rx_per_sec: now.rx_per_sec,
+        tx_per_sec: now.tx_per_sec,
+        disk_used: now.disk.map(|(used, _)| used),
+        disk_total: now.disk.map(|(_, total)| total),
+    }))
+}
+
+async fn list_metrics(State(app): State<AppState>) -> Json<Vec<MetricView>> {
+    Json(
+        app.metrics
+            .list()
+            .into_iter()
+            .map(|(id, metric)| metric_view(id, &metric))
+            .collect(),
+    )
+}
+
+async fn get_metric(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<MetricView>, ApiError> {
+    // A built-in metric (`claude-code`) starts being gathered when it is first asked for, as
+    // when a dashboard first shows its panel; until the first figures are in, it is not found.
+    app.metrics.activate(&id);
+    let metric = app
+        .metrics
+        .get(&id)
+        .ok_or_else(|| ApiError::not_found(format!("no metric {id:?}")))?;
+    Ok(Json(metric_view(id, &metric)))
+}
+
+async fn set_metric(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Json(update): Json<MetricUpdate>,
+) -> Result<StatusCode, ApiError> {
+    app.metrics
+        .set(&id, update)
+        .map_err(ApiError::bad_request)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_metric(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if app.metrics.remove(&id) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found(format!("no metric {id:?}")))
+    }
+}
+
+fn metric_view(id: String, metric: &Metric) -> MetricView {
+    MetricView {
+        label: metric.label.clone().unwrap_or_else(|| id.clone()),
+        id,
+        value: metric.value,
+        text: metric.text.clone(),
+        unit: metric.unit.clone(),
+        detail: metric.detail.clone(),
+        max: metric.max,
+        ttl: metric.ttl.as_secs(),
+        updated: metric.updated_at.to_string(),
+        age: metric.age().as_secs(),
+        stale: metric.is_stale(),
+        history: metric.history.iter().copied().collect(),
+    }
+}

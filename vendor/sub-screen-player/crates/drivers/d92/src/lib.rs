@@ -1,0 +1,423 @@
+//! Driver for the D92/V92 9.2-inch 1920x462 USB display, sold as the upHere D92,
+//! MiraBox D92 and darkFlash V92 (USB `2100:0006` and newer `1800:3012` revisions).
+//!
+//! - [`protocol`] builds the reports (pure, unit-tested against known-good bytes).
+//! - [`D92`] implements [`ssp_core::Display`] on top of any [`Transport`].
+//! - [`D92Driver`] finds the device and opens it over HID.
+//!
+//! Protocol notes: `docs/devices/d92.md`.
+#![warn(missing_docs)]
+
+pub mod protocol;
+
+use std::time::{Duration, Instant};
+
+use ssp_core::{
+    Candidate, Capabilities, Display, DisplayInfo, Driver, EncodedImage, Error, ImageFormat,
+    PanelSpec, Result, Rotation, Transport, UsbMatch, hid,
+};
+
+use protocol::{REPORT_LEN, StoreMode};
+
+/// How long the device needs to store an image; frames sent earlier get lost.
+const STORE_TIME: Duration = Duration::from_millis(1500);
+/// How often opening asks for the firmware version: right after a stopped program was sending
+/// pictures, the first answer can be something else.
+const VERSION_TRIES: u32 = 3;
+
+/// Finds D92 displays and opens them over HID.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D92Driver;
+
+impl Driver for D92Driver {
+    fn id(&self) -> &'static str {
+        "d92"
+    }
+
+    fn name(&self) -> &'static str {
+        "upHere / MiraBox D92 / darkFlash V92"
+    }
+
+    fn usb_matches(&self) -> &'static [UsbMatch] {
+        &[
+            UsbMatch {
+                vendor_id: protocol::VENDOR_ID,
+                product_id: protocol::PRODUCT_ID,
+                usage_page: Some(protocol::USAGE_PAGE),
+            },
+            UsbMatch {
+                vendor_id: protocol::MIRABOX_VENDOR_ID,
+                product_id: protocol::MIRABOX_PRODUCT_ID,
+                usage_page: Some(protocol::USAGE_PAGE),
+            },
+        ]
+    }
+
+    fn open(&self, candidate: &Candidate) -> Result<Box<dyn Display>> {
+        let transport = hid::open(candidate)?;
+        Ok(Box::new(D92::open(Box::new(transport), &candidate.serial)?))
+    }
+}
+
+/// An open D92.
+pub struct D92 {
+    transport: Box<dyn Transport>,
+    info: DisplayInfo,
+    /// Set by `clear`, which ends the device's session; the next frame wakes it first.
+    session_ended: bool,
+    /// Until when the device is busy storing an image.
+    busy_until: Option<Instant>,
+    /// When the last `DRA` was written (see [`protocol::DRA_GAP`]).
+    last_dra: Option<Instant>,
+}
+
+impl D92 {
+    /// Takes over a device: reads its firmware version (where the platform allows it) and
+    /// switches the screen on.
+    pub fn open(mut transport: Box<dyn Transport>, serial: &str) -> Result<Self> {
+        let mut report = [0u8; 512];
+        let mut firmware = None;
+        for attempt in 0..VERSION_TRIES {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            match transport.get_input_report(0, &mut report) {
+                Ok(n) => firmware = protocol::parse_version(&report[..n]),
+                Err(err) if err.is_fatal() => return Err(err),
+                // The platform cannot read input reports: asking again will not help.
+                Err(_) => break,
+            }
+            if firmware.is_some() {
+                break;
+            }
+        }
+        let model = match &firmware {
+            Some(v) if v.contains("V92") => "darkFlash V92",
+            Some(v) if v.contains("upHere") => "upHere D92",
+            _ => "D92",
+        };
+        let info = DisplayInfo {
+            driver: "d92",
+            model: model.to_string(),
+            serial: serial.to_string(),
+            firmware,
+            panel: PanelSpec {
+                width: protocol::WIDTH,
+                height: protocol::HEIGHT,
+                // The controller scans the panel in portrait.
+                rotation: Rotation::Clockwise90,
+                format: ImageFormat::Jpeg,
+            },
+            capabilities: Capabilities {
+                live_frames: true,
+                saved_frames: true,
+                brightness: true,
+                power: true,
+                clear: true,
+                max_fps: 60,
+                keep_alive_interval: Some(Duration::from_secs(2)),
+                max_image_bytes: protocol::MAX_JPEG_LEN,
+                partial_images: true,
+            },
+        };
+        let mut d92 = Self {
+            transport,
+            info,
+            session_ended: false,
+            busy_until: None,
+            last_dra: None,
+        };
+        d92.send(&protocol::wake())?;
+        Ok(d92)
+    }
+
+    fn send(&mut self, reports: &[u8]) -> Result<()> {
+        debug_assert_eq!(reports.len() % REPORT_LEN, 0);
+        reports
+            .chunks(REPORT_LEN)
+            .try_for_each(|report| self.transport.write_report(report))
+    }
+
+    /// Checks a whole image, or with `part`, an image of a part of the panel.
+    fn check(&self, image: &EncodedImage, part: bool) -> Result<()> {
+        let (width, height) = self.info.panel.encoded_size();
+        let fits = if part {
+            image.width > 0
+                && image.height > 0
+                && image.x + image.width <= width
+                && image.y + image.height <= height
+        } else {
+            image.is_whole(&self.info.panel)
+        };
+        if image.format != ImageFormat::Jpeg || !fits || !image.data.starts_with(&[0xFF, 0xD8]) {
+            return Err(Error::InvalidArgument(format!(
+                "the D92 takes JPEGs of {width}x{height} or of a part of that"
+            )));
+        }
+        if image.data.len() > protocol::MAX_JPEG_LEN {
+            return Err(Error::InvalidArgument(format!(
+                "JPEG is {} bytes, the D92 takes at most {}",
+                image.data.len(),
+                protocol::MAX_JPEG_LEN
+            )));
+        }
+        Ok(())
+    }
+
+    /// Prepares for an image: waits for a running store and restarts an ended session.
+    fn before_image(&mut self) -> Result<()> {
+        if let Some(until) = self.busy_until.take() {
+            std::thread::sleep(until.saturating_duration_since(Instant::now()));
+        }
+        if self.session_ended {
+            self.send(&protocol::wake())?;
+            self.session_ended = false;
+        }
+        Ok(())
+    }
+}
+
+impl Display for D92 {
+    fn info(&self) -> &DisplayInfo {
+        &self.info
+    }
+
+    fn show(&mut self, image: &EncodedImage) -> Result<()> {
+        let whole = image.is_whole(&self.info.panel);
+        self.check(image, !whole)?;
+        self.before_image()?;
+        if let Some(last) = self.last_dra {
+            std::thread::sleep(
+                (last + protocol::DRA_GAP).saturating_duration_since(Instant::now()),
+            );
+        }
+        let reports = if whole {
+            protocol::live_frame(&image.data)
+        } else {
+            let place = |v: u32| u16::try_from(v).expect("checked to be on the panel");
+            protocol::live_region(
+                &image.data,
+                place(image.x),
+                place(image.y),
+                place(image.width),
+                place(image.height),
+            )
+        };
+        let sent = self.send(&reports);
+        // Counted from the end: a large image takes a while to write, and the device draws it
+        // only after that.
+        self.last_dra = Some(Instant::now());
+        sent
+    }
+
+    fn save(&mut self, image: &EncodedImage) -> Result<()> {
+        self.check(image, false)?;
+        self.before_image()?;
+        self.send(&protocol::stored_image(&image.data, StoreMode::Saved))?;
+        self.busy_until = Some(Instant::now() + STORE_TIME);
+        Ok(())
+    }
+
+    fn set_brightness(&mut self, percent: u8) -> Result<()> {
+        self.send(&protocol::brightness(percent))
+    }
+
+    fn wake(&mut self) -> Result<()> {
+        self.session_ended = false;
+        self.send(&protocol::wake())
+    }
+
+    fn sleep(&mut self) -> Result<()> {
+        self.send(&protocol::sleep())
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        self.send(&protocol::clear())?;
+        self.session_ended = true;
+        Ok(())
+    }
+
+    fn keep_alive(&mut self) -> Result<()> {
+        self.send(&protocol::keep_alive())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ssp_core::testing::RecordingTransport;
+    use ssp_core::{Encoder, Frame};
+
+    fn open() -> (D92, RecordingTransport) {
+        let transport =
+            RecordingTransport::new().with_input_report(b"V25.upHere_gamingD92.02.014\0\0");
+        let d92 = D92::open(Box::new(transport.clone()), "470B03781D1F").unwrap();
+        (d92, transport)
+    }
+
+    fn jpeg(d92: &D92) -> EncodedImage {
+        let frame = Frame::blank(protocol::WIDTH, protocol::HEIGHT);
+        Encoder::default()
+            .encode(&frame, &d92.info().panel, protocol::MAX_JPEG_LEN)
+            .unwrap()
+    }
+
+    fn words(reports: &[Vec<u8>]) -> Vec<String> {
+        reports
+            .iter()
+            .filter(|r| r.starts_with(b"CRT\0\0"))
+            .map(|r| {
+                r[5..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_uppercase())
+                    .map(|&b| b as char)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn matches_both_known_usb_revisions() {
+        let matches = D92Driver.usb_matches();
+        assert!(matches.iter().any(|m| {
+            m.vendor_id == protocol::VENDOR_ID && m.product_id == protocol::PRODUCT_ID
+        }));
+        assert!(matches.iter().any(|m| {
+            m.vendor_id == protocol::MIRABOX_VENDOR_ID
+                && m.product_id == protocol::MIRABOX_PRODUCT_ID
+        }));
+        assert!(
+            matches
+                .iter()
+                .all(|m| m.usage_page == Some(protocol::USAGE_PAGE))
+        );
+    }
+
+    #[test]
+    fn open_asks_for_the_version_again() {
+        let transport = RecordingTransport::new()
+            .with_input_report(b"\0\0\0\0")
+            .with_input_report(b"V25.upHere_gamingD92.02.014\0\0");
+        let d92 = D92::open(Box::new(transport), "470B03781D1F").unwrap();
+        assert_eq!(d92.info().model, "upHere D92");
+        // Without a version, it is a D92 all the same.
+        let transport = RecordingTransport::new().with_input_report(b"\0\0\0\0");
+        let d92 = D92::open(Box::new(transport), "470B03781D1F").unwrap();
+        assert_eq!(
+            (d92.info().model.as_str(), d92.info().firmware.as_deref()),
+            ("D92", None)
+        );
+    }
+
+    #[test]
+    fn open_reads_version_and_wakes() {
+        let (d92, transport) = open();
+        assert_eq!(
+            d92.info().firmware.as_deref(),
+            Some("V25.upHere_gamingD92.02.014")
+        );
+        assert_eq!(d92.info().model, "upHere D92");
+        assert_eq!(d92.info().id(), "d92-470B03781D1F");
+        assert_eq!(words(&transport.take()), ["DIS"]);
+    }
+
+    #[test]
+    fn open_works_without_version_report() {
+        let d92 = D92::open(Box::new(RecordingTransport::new()), "").unwrap();
+        assert_eq!(d92.info().firmware, None);
+        assert_eq!(d92.info().id(), "d92");
+    }
+
+    #[test]
+    fn show_sends_one_live_frame() {
+        let (mut d92, transport) = open();
+        transport.take();
+        let image = jpeg(&d92);
+        d92.show(&image).unwrap();
+        let reports = transport.take();
+        assert_eq!(reports.len(), (32 + image.data.len()).div_ceil(REPORT_LEN));
+        assert!(reports.iter().all(|r| r.len() == REPORT_LEN));
+        assert_eq!(words(&reports), ["DRA"]);
+        assert_eq!(&reports[0][32..34], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn shows_a_part_of_the_panel_and_paces_dras() {
+        let (mut d92, transport) = open();
+        transport.take();
+        // The driver only checks the place; any JPEG will do.
+        let image = EncodedImage {
+            x: 400,
+            y: 96,
+            width: 16,
+            height: 32,
+            ..jpeg(&d92)
+        };
+        let started = Instant::now();
+        d92.show(&image).unwrap();
+        d92.show(&image).unwrap();
+        assert!(started.elapsed() >= protocol::DRA_GAP);
+        let reports = transport.take();
+        assert_eq!(words(&reports), ["DRA", "DRA"]);
+        assert_eq!(&reports[0][13..21], &[0, 16, 0, 32, 0x01, 0x90, 0, 96]);
+        // A part that does not fit on the panel is refused.
+        let outside = EncodedImage { x: 450, ..image };
+        assert!(matches!(d92.show(&outside), Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn show_after_clear_wakes_first() {
+        let (mut d92, transport) = open();
+        d92.clear().unwrap();
+        let image = jpeg(&d92);
+        d92.show(&image).unwrap();
+        d92.show(&image).unwrap();
+        assert_eq!(
+            words(&transport.take()),
+            ["DIS", "CLE", "DIS", "DRA", "DRA"]
+        );
+    }
+
+    #[test]
+    fn save_stores_with_log_and_stp() {
+        let (mut d92, transport) = open();
+        transport.take();
+        d92.save(&jpeg(&d92)).unwrap();
+        let reports = transport.take();
+        assert_eq!(words(&reports), ["LOG", "STP"]);
+        assert_eq!(reports[0][12], StoreMode::Saved as u8);
+    }
+
+    #[test]
+    fn rejects_images_in_the_wrong_orientation() {
+        let (mut d92, _) = open();
+        let mut image = jpeg(&d92);
+        std::mem::swap(&mut image.width, &mut image.height);
+        assert!(matches!(d92.show(&image), Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn write_errors_are_fatal() {
+        let (mut d92, transport) = open();
+        transport.fail_writes();
+        assert!(d92.keep_alive().unwrap_err().is_fatal());
+    }
+
+    #[test]
+    fn never_sends_screen() {
+        let (mut d92, transport) = open();
+        let image = jpeg(&d92);
+        d92.show(&image).unwrap();
+        d92.set_brightness(30).unwrap();
+        d92.sleep().unwrap();
+        d92.wake().unwrap();
+        d92.keep_alive().unwrap();
+        d92.clear().unwrap();
+        assert!(
+            !transport
+                .take()
+                .iter()
+                .any(|r| r.starts_with(b"CRT\0\0SCREEN"))
+        );
+    }
+}

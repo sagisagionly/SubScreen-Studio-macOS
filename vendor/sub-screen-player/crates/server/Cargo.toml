@@ -1,0 +1,40 @@
+[package]
+name = "ssp-server"
+description = "sub-screen-player daemon: device manager, frame sources and the HTTP/WebSocket API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ssp-core.workspace = true
+ssp-driver-d92.workspace = true
+ssp-driver-dq288.workspace = true
+ab_glyph.workspace = true
+base64.workspace = true
+directories.workspace = true
+fontdb.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+image.workspace = true
+jiff.workspace = true
+memchr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tungstenite.workspace = true
+url.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>SubScreen Studio</string>
+    <key>CFBundleExecutable</key>
+    <string>SubScreenStudio</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.subscreen.studio</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>SubScreen Studio</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+	<string>0.14.0</string>
+    <key>CFBundleVersion</key>
+	<string>22</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>SubScreen Studio reads the current song from Apple Music and YouTube Music browser tabs for the Now Playing widget.</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>SubScreen Studio detects when your AirPods connect so it can show the connection animation on your sub-screen.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>SubScreen Studio shows your next event in the Calendar widget.</string>
+    <key>NSRemindersFullAccessUsageDescription</key>
+    <string>SubScreen Studio shows your incomplete tasks in the Reminders widget.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>SubScreen Studio uses microphone levels to animate the live audio visualizer. Audio is processed on this Mac and is not recorded.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>SubScreen Studio uses your current area to show local weather in the Environment widget.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>SubScreen Studio captures only the window you choose for the Window Capture widget.</string>
+</dict>
+</plist>

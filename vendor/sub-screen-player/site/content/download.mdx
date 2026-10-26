@@ -1,0 +1,76 @@
+---
+title: Download
+description: Prebuilt ssp binaries for macOS, Linux and Windows.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+import Download from '../../components/Download.astro';
+import InstallCommand from '../../components/InstallCommand.astro';
+
+The quickest way is the installer, which picks the right file for you:
+
+<Tabs syncKey="os">
+	<TabItem label="macOS / Linux">
+		<InstallCommand os="unix" />
+	</TabItem>
+	<TabItem label="Windows">
+		<InstallCommand os="windows" />
+	</TabItem>
+</Tabs>
+
+With a package manager, which also updates `ssp` later:
+
+<Tabs syncKey="os">
+	<TabItem label="macOS / Linux">
+
+```sh
+brew install nomunomu0504/tap/ssp
+```
+
+	</TabItem>
+	<TabItem label="Windows">
+
+```powershell
+scoop bucket add nomunomu0504 https://github.com/nomunomu0504/scoop-bucket
+scoop install nomunomu0504/ssp
+```
+
+	</TabItem>
+</Tabs>
+
+To install a given release instead of the latest (for example to update from a script only to
+a version you have checked), set `SSP_VERSION`; `SSP_INSTALL_DIR` changes where `ssp` goes:
+
+<Tabs syncKey="os">
+	<TabItem label="macOS / Linux">
+
+```sh
+curl -fsSL https://subscreen.dev/install.sh | SSP_VERSION=v0.7.1 sh
+```
+
+	</TabItem>
+	<TabItem label="Windows">
+
+```powershell
+$env:SSP_VERSION = "v0.7.1"; irm https://subscreen.dev/install.ps1 | iex
+```
+
+	</TabItem>
+</Tabs>
+
+Or download an archive, extract it and put `ssp` (`ssp.exe` on Windows) somewhere on your
+`PATH`:
+
+<Download lang="en" />
+
+<Aside type="caution" title="The binaries are not code-signed yet">
+- **macOS** may refuse to run a downloaded `ssp`. Remove the quarantine flag once:
+  `xattr -d com.apple.quarantine ssp` (the installer does not need this).
+- **Windows** SmartScreen may warn on first start: choose "More info" → "Run anyway".
+</Aside>
+
+To check a download yourself, compare its SHA-256 with `SHA256SUMS.txt`:
+`shasum -a 256 <file>` on macOS, `sha256sum <file>` on Linux, `Get-FileHash <file>` on
+Windows.
+
+On Linux, also install the udev rule; see [Getting started](../getting-started/).

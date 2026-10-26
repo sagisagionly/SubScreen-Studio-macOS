@@ -1,0 +1,15 @@
+[package]
+name = "ssp-driver-dq288"
+description = "sub-screen-player driver for the DQ/Qscreen 2.88-inch 480x480 USB display"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ssp-core.workspace = true
+ssp-driver-d92.workspace = true
+
+[lints]
+workspace = true

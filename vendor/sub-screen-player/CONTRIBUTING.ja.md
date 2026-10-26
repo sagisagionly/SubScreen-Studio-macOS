@@ -1,0 +1,131 @@
+# sub-screen-player へのコントリビュート
+
+[English](CONTRIBUTING.md)
+
+ご協力ありがとうございます。不具合の報告、新しいディスプレイへの対応、機能追加、ドキュメントの改善など、
+どれも歓迎します。このガイドでは、開発環境の作り方、コードをどこに置くか、プルリクエストに必要なことを説明します。
+
+## 貢献の方法
+
+- **不具合を報告する**: Issue のフォームから、OS、ディスプレイの機種、`ssp selftest`（デーモンを止めて実行）・`ssp devices`・
+  `ssp status` の出力、デーモンのログ（`SSP_LOG=debug ssp serve` で詳細が出ます）を添えて報告してください。
+- **脆弱性を報告する**: 公開の Issue ではなく、[SECURITY.ja.md](SECURITY.ja.md) の手順に従って非公開で報告してください。
+- **ディスプレイを追加する**: [docs/adding-a-device.ja.md](docs/adding-a-device.ja.md) の手順に従ってください。
+  表示の仕組みについてのメモしかない場合でも、Issue に共有してもらえれば、ほかの人がドライバを書けるかもしれません。
+- **[ギャラリー](https://subscreen.dev/ja/screens/)に画面を追加する**: `site/public/screens/<名前>/index.html` に
+  1920x462 のページを書きます。数値は `window.ssp` から読み、`window.ssp` がないときは例の数値を表示して、ブラウザでも
+  試せるようにしてください（インターネットから読む画面は `?example` で例の数値にします）。画面は一日中表示されるので、
+  ずっと動き続けるアニメーションや、毎秒動くトランジションは避けてください。ページが動いている間、ブラウザは描き続けます
+  （system の画面は、リングに 0.6 秒のトランジションがあると CPU 1コアの 3 分の 1 ほど、なければ 5% でした）。
+  `sh site/scripts/shoot-screens.sh <名前>` で画像を作り、`site/src/components/gallery/screens.ts` に追加します。
+- **機能やドキュメントを改善する**: 小さな修正より大きい変更は、まず Issue を立てて進め方を相談してください。
+  作業を始める前に方向性を合わせておくと、手戻りを防げます。
+
+## 開発環境
+
+ツールのバージョンは [`mise.toml`](mise.toml) で固定しているので、全員が同じ Rust でビルドします。
+
+```sh
+mise install        # 固定された Rust（rustfmt・clippy 付き）を導入
+mise run ci         # CI と同じチェック: フォーマット確認、clippy、テスト
+```
+
+| タスク | 内容 |
+|---|---|
+| `mise run fmt` | コードを整形 |
+| `mise run lint` | 警告をエラー扱いにして `cargo clippy` を実行 |
+| `mise run test` | 全テストを実行（実機は不要） |
+| `mise run build` | リリースビルド（`target/release/ssp`） |
+| `mise run serve` | ソースからデーモンを起動 |
+
+Web サイト（`site/`。[Astro Starlight](https://starlight.astro.build) と [bun](https://bun.sh) で作っており、
+どちらも mise が入れます）は、`docs/`・`CONTRIBUTING`・`SECURITY` のドキュメントをそのまま表示しています。
+内容を直すときは、コピーではなく元のファイルを編集してください。`mise run site:dev` でライブリロード付きのローカル表示、
+`mise run site:build` で `site/dist` へのビルドができます。
+
+Rust のほかに、macOS と Windows では同梱の hidapi ライブラリをビルドするための C コンパイラが必要です。macOS では
+Xcode Command Line Tools（`xcode-select --install`）、Windows では Rust がもともと必要とする MSVC のビルドツールです。
+Linux の HID バックエンドは `hidraw` を直接扱うため、ほかに必要なものはありません。
+
+## どこに何を書くか
+
+ワークスペースは責務ごとに分かれています。原則は **「機種固有のバイト列は、ちょうど1つのドライバクレートの中だけに置き、
+ほかの場所はそれを知らない」** です。
+
+| やりたいこと | 置き場所 |
+|---|---|
+| 新しい機種に対応する | `crates/drivers/<model>/`（新しいクレート） |
+| 既存の機種との通信方法を変える | `crates/drivers/<model>/src/protocol.rs` |
+| 全ディスプレイに必要なもの（機能、エンコード方式、通信方式、送信ペース）を追加する | `crates/core/` |
+| 組み込みの画面（時計のようなもの）を追加する | `crates/server/src/sources/` |
+| API のエンドポイントを追加・変更する | `crates/server/src/api/`（＋ `docs/api.md` / `docs/api.ja.md`） |
+| 設定項目を追加する | `crates/server/src/config.rs`（同じファイルの `TEMPLATE` も） |
+| CLI のコマンドを追加する | `crates/cli/src/main.rs`（＋ `docs/cli.md` / `docs/cli.ja.md`） |
+| OS ごとの自動起動を変える | `crates/cli/src/service.rs` |
+| Linux でのデバイスのアクセス権 | `contrib/linux/70-sub-screen-player.rules` |
+| Web サイトのトップページ（文言は `copy.ts`） | `site/src/components/landing/` |
+| ギャラリーの画面 | `site/public/screens/<名前>/`（＋ `site/src/components/gallery/screens.ts`） |
+| ドキュメント側にある Web サイト専用のページ（はじめに、ダウンロード） | `site/content/`（と `site/content/ja/`） |
+| Web サイトに載せるドキュメントを増やす | `site/scripts/sync-docs.ts` と `site/astro.config.mjs` のサイドバー |
+
+依存の向きは一方向だけです: `cli` → `server` → `drivers/*` → `core`。ドライバがほかのドライバやサーバに
+依存することはありません。各層の詳細は [docs/architecture.ja.md](docs/architecture.ja.md) を参照してください。
+
+## コーディングの指針
+
+- `rustfmt` に従い、`clippy` の警告をゼロに保ってください（`mise run ci` が通る必要があります）。
+- このワークスペースでは `unsafe` コードを禁止しています。
+- コード、コメント、コミットメッセージは英語で書きます。
+- ドキュメントは英語版（`*.md`）と日本語版（`*.ja.md`）の両方があります。片方を変えたら、もう片方も更新してください。
+  どちらかの言語で書けない場合は、プルリクエストにその旨を書いてもらえれば、翻訳を手伝います。
+- 公開する要素にはドキュメントコメントを付けます。コメントには「何をしているか」ではなく「なぜそうするか」を書きます。
+- プロトコルのコードは純粋に保ちます。I/O を持たず、バイト列を組み立てるだけの関数にすると、バイト単位でテストできます。
+- 大きなクレートやモジュールより、小さく焦点の絞られたものを好みます。新しい依存クレートを足すときは、
+  プルリクエストに理由を書いてください。C ライブラリを必要とするものは避けてください。
+
+## テスト
+
+実機がなくても、すべてテストできます。
+
+- `ssp_core::testing::RecordingTransport` は、ドライバが送ったレポートを記録します。
+- `ssp_core::testing::FakeDisplay` は、Presenter やサーバのテストでディスプレイの代わりになります。
+
+ドライバのテストでは、実機で動くと分かっているレポートとバイト単位で比較してください。実機でも試した場合は、
+何を確認したか（機種、OS、表示した内容）と `ssp selftest` の出力をプルリクエストに書いてください。
+
+## コミットとプルリクエスト
+
+コミットメッセージは [Conventional Commits](https://www.conventionalcommits.org/ja/) に従います（本文は英語）。
+
+```
+feat(d92): support the boot logo upload
+fix(server): keep the clock running after a replug
+docs: explain the stream format
+```
+
+よく使うスコープ: `core`、`d92`（またはほかのドライバ ID）、`server`、`cli`、`docs`、`ci`
+
+プルリクエストを出す前に:
+
+- [ ] `mise run ci` が通る
+- [ ] 新しい挙動にテストがある
+- [ ] 利用者に見える変更が README と `docs/` に、英語・日本語の両方で反映されている
+- [ ] 実機での確認内容が書かれている（確認していない場合はその旨）
+
+## 通信を調べるときの作法
+
+多くのディスプレイには公開ドキュメントがないため、ドライバは実機でコマンドを試しながら作ることがよくあります。
+
+- プロトコルの解析は相互運用のためだけに行ってください。メーカー製ソフトのコード、バイナリ、ファームウェア、
+  画像、フォントをこのリポジトリにコピーしないでください。
+- 事実をどうやって見つけたか（実験、公開されている SDK など）を `docs/devices/<model>.md`（と `.ja.md`）に書き、
+  確認済みのことと推測とを区別してください。
+- 個人情報を含む可能性のある生のログやダンプはコミットしないでください。必要なバイト列だけに絞ってください。
+- コマンドによっては、デバイスが応答しなくなったり、保存された画像を上書きしたりします。そうした発見は書き残し、
+  ドライバがうっかり危険なコマンドを送らないようにしてください。
+
+## ライセンス
+
+明示的に別の意思表示をしない限り、あなたが本プロジェクトへの取り込みを意図して提出したコントリビューション
+（Apache-2.0 ライセンスで定義されるもの）は、[README](README.ja.md#ライセンス) に記載のとおり、追加の条件なしに
+デュアルライセンスで提供されるものとします。

@@ -1,0 +1,353 @@
+//! Built-in sources: things that draw frames by themselves inside the daemon.
+//!
+//! A new built-in screen is a new module here implementing [`Source`], plus a [`Content`]
+//! variant that creates it. Frames from outside the daemon (HTTP, WebSocket) do not need a
+//! source; they are submitted to the display directly.
+
+mod animation;
+mod clock;
+mod dashboard;
+pub(crate) use dashboard::number;
+mod layout;
+mod rotation;
+pub mod stats;
+pub mod video;
+pub mod web;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use image::DynamicImage;
+use ssp_core::{Animation, Fit, Frame};
+
+pub use clock::Clock;
+pub use dashboard::Dashboard;
+pub use layout::{Feed, LayoutSpec, Zone};
+pub use rotation::Turn;
+
+use crate::config::{
+    ClockConfig, Config, DashboardConfig, LayoutConfig, ShowSpec, StartupShow, Widget, ZoneKind,
+};
+use crate::metrics::Metrics;
+
+/// Something that draws a picture and knows when it changes.
+pub trait Source: Send {
+    /// Draws the current picture into `frame` (landscape, panel-sized).
+    fn render(&mut self, frame: &mut Frame);
+
+    /// How long until the picture changes. `None` if it never does.
+    fn next_change(&self) -> Option<Duration>;
+}
+
+/// What a display is told to show.
+#[derive(Clone)]
+pub enum Content {
+    /// Nothing is sent; the screen keeps what it has.
+    Nothing,
+    /// A still image.
+    Image {
+        /// The image at its original size.
+        image: Arc<DynamicImage>,
+        /// How it is fitted to the panel.
+        fit: Fit,
+    },
+    /// An animated GIF, APNG or WebP, played in a loop.
+    Animation {
+        /// The frames at their original size.
+        animation: Arc<Animation>,
+        /// How each frame is fitted to the panel.
+        fit: Fit,
+    },
+    /// A video file, played in a loop by ffmpeg.
+    Video {
+        /// The file.
+        video: Arc<video::VideoFile>,
+        /// How each frame is fitted to the panel.
+        fit: Fit,
+    },
+    /// A web page drawn by headless Chrome.
+    Web {
+        /// The page.
+        page: web::WebPage,
+        /// The browser settings.
+        web: crate::web::Web,
+    },
+    /// The built-in clock.
+    Clock(ClockConfig),
+    /// The built-in dashboard; its clock panel uses the clock settings and its `metric:<id>`
+    /// panels the metrics sent to the daemon.
+    Dashboard(DashboardConfig, ClockConfig, Metrics),
+    /// Frames from a WebSocket client.
+    Stream,
+    /// Several contents in turn.
+    Rotation(Arc<Vec<Turn>>),
+    /// Several contents side by side.
+    Layout(Arc<LayoutSpec>),
+}
+
+impl Content {
+    /// Short name used by the API.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Nothing => "nothing",
+            Self::Image { .. } => "image",
+            Self::Animation { .. } => "animation",
+            Self::Video { .. } => "video",
+            Self::Web { .. } => "web",
+            Self::Clock(_) => "clock",
+            Self::Dashboard(..) => "dashboard",
+            Self::Stream => "stream",
+            Self::Rotation(_) => "rotation",
+            Self::Layout(_) => "layout",
+        }
+    }
+
+    /// The source that produces this content, if it is drawn inside the daemon.
+    pub fn source(&self) -> Option<Box<dyn Source>> {
+        match self {
+            Self::Nothing | Self::Stream => None,
+            Self::Image { image, fit } => Some(Box::new(Still {
+                image: image.clone(),
+                fit: *fit,
+            })),
+            Self::Animation { animation, fit } => {
+                Some(Box::new(animation::Player::new(animation.clone(), *fit)))
+            }
+            Self::Video { video, fit } => Some(Box::new(video::Player::new(video.clone(), *fit))),
+            Self::Web { page, web } => Some(Box::new(web::Page::new(page.clone(), web.clone()))),
+            Self::Clock(config) => Some(Box::new(Clock::new(config.clone()))),
+            Self::Dashboard(dashboard, clock, metrics) => Some(Box::new(Dashboard::new(
+                dashboard.clone(),
+                clock.clone(),
+                metrics.clone(),
+            ))),
+            Self::Rotation(turns) => Some(Box::new(rotation::Rotation::new(turns.clone()))),
+            Self::Layout(spec) => Some(Box::new(layout::Layout::new(spec.clone()))),
+        }
+    }
+
+    /// The content `spec` describes, with the looks, browser and player settings of `config`.
+    /// Files are read (and checked) now; a rotation takes its turns from `[rotation]`.
+    pub fn from_spec(
+        spec: ShowSpec<'_>,
+        config: &Config,
+        metrics: &Metrics,
+    ) -> Result<Self, String> {
+        match spec.show {
+            StartupShow::Nothing => Ok(Self::Nothing),
+            StartupShow::Clock => {
+                Clock::validate(&config.clock)?;
+                Ok(Self::Clock(config.clock.clone()))
+            }
+            StartupShow::Dashboard => {
+                Clock::validate(&config.clock)?;
+                config.dashboard.validate()?;
+                Ok(Self::Dashboard(
+                    config.dashboard.clone(),
+                    config.clock.clone(),
+                    metrics.clone(),
+                ))
+            }
+            StartupShow::Web => {
+                let url = spec.url.ok_or("url is not set")?;
+                let page = web::WebPage::new(url, spec.reload).map_err(|e| format!("url: {e}"))?;
+                Ok(Self::Web {
+                    page,
+                    web: crate::web::Web::new(&config.web).with_api(config.listen),
+                })
+            }
+            StartupShow::Image => {
+                let path = spec.image.ok_or("image is not set")?;
+                let fit = spec.fit.into();
+                if starts_like_a_video(path) {
+                    let ffmpeg = video::find_ffmpeg(config.video.ffmpeg.as_deref())?;
+                    let file = video::VideoFile::open(path.to_owned(), ffmpeg, false)
+                        .map_err(|e| format!("video {}: {e}", path.display()))?;
+                    return Ok(Self::Video {
+                        video: Arc::new(file),
+                        fit,
+                    });
+                }
+                let bytes = std::fs::read(path)
+                    .map_err(|e| format!("cannot read image {}: {e}", path.display()))?;
+                let picture = Picture::decode(&bytes)
+                    .map_err(|e| format!("image {}: {e}", path.display()))?;
+                Ok(picture.into_content(fit))
+            }
+            StartupShow::Rotation => {
+                let every = Duration::from_secs(config.rotation.every.max(1));
+                let turns = config
+                    .rotation
+                    .show
+                    .iter()
+                    .enumerate()
+                    .map(|(n, item)| {
+                        let (spec, seconds) = item.spec();
+                        if spec.show == StartupShow::Rotation {
+                            return Err(format!(
+                                "rotation screen {}: a rotation in a rotation",
+                                n + 1
+                            ));
+                        }
+                        Ok(Turn {
+                            content: Self::from_spec(spec, config, metrics)
+                                .map_err(|e| format!("rotation screen {}: {e}", n + 1))?,
+                            duration: seconds.map_or(every, Duration::from_secs),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                if turns.is_empty() {
+                    return Err("[rotation] show has no screens".into());
+                }
+                Ok(Self::Rotation(Arc::new(turns)))
+            }
+            StartupShow::Layout => match spec.layout {
+                Some(name) => Self::named_layout(name, config, metrics),
+                None => Self::layout(&config.layout, config, metrics),
+            },
+        }
+    }
+
+    /// The layout `[layouts.<name>]` of `config`.
+    pub fn named_layout(name: &str, config: &Config, metrics: &Metrics) -> Result<Self, String> {
+        let layout = config
+            .layouts
+            .get(name)
+            .ok_or_else(|| format!("no layout {name:?} in [layouts]"))?;
+        Self::layout(layout, config, metrics).map_err(|e| format!("layouts.{name}: {e}"))
+    }
+
+    /// The layout `layout`, with the other settings of `config`.
+    pub fn layout(
+        layout: &LayoutConfig,
+        config: &Config,
+        metrics: &Metrics,
+    ) -> Result<Self, String> {
+        layout.validate()?;
+        if layout.zones.is_empty() {
+            return Err("the layout has no zones".into());
+        }
+        let background =
+            crate::config::parse_color(&layout.background).ok_or("bad layout background")?;
+        let mut zones = Vec::with_capacity(layout.zones.len());
+        for (n, zone) in layout.zones.iter().enumerate() {
+            let fail = |e: String| format!("layout zone {} ({}): {e}", n + 1, zone.show);
+            let spec = |show| ShowSpec {
+                show,
+                image: zone.image.as_deref(),
+                url: zone.url.as_deref(),
+                reload: zone.reload,
+                fit: zone.fit.unwrap_or_default(),
+                layout: None,
+            };
+            let content = match zone.kind().map_err(fail)? {
+                ZoneKind::Panel(Widget::Clock) => {
+                    Self::from_spec(spec(StartupShow::Clock), config, metrics)
+                }
+                ZoneKind::Panel(widget) => {
+                    let dashboard = DashboardConfig {
+                        widgets: vec![widget],
+                        ..config.dashboard.clone()
+                    };
+                    dashboard
+                        .validate()
+                        .map(|()| Self::Dashboard(dashboard, config.clock.clone(), metrics.clone()))
+                }
+                ZoneKind::Dashboard => {
+                    Self::from_spec(spec(StartupShow::Dashboard), config, metrics)
+                }
+                ZoneKind::Image => Self::from_spec(spec(StartupShow::Image), config, metrics),
+                ZoneKind::Web => Self::from_spec(spec(StartupShow::Web), config, metrics),
+                ZoneKind::Stream => Ok(Self::Stream),
+                ZoneKind::Nothing => Ok(Self::Nothing),
+            }
+            .map_err(fail)?;
+            zones.push(Zone {
+                content,
+                width: zone.width,
+            });
+        }
+        if zones.iter().filter(|z| z.content.kind() == "video").count() > 1 {
+            return Err("a layout can play one video at a time".into());
+        }
+        let feed = zones
+            .iter()
+            .any(|z| matches!(z.content, Self::Stream))
+            .then(Arc::default);
+        Ok(Self::Layout(Arc::new(LayoutSpec {
+            zones,
+            gap: layout.gap,
+            background,
+            feed,
+        })))
+    }
+}
+
+/// Whether the file at `path` starts like a video (see [`video::is_video`]).
+fn starts_like_a_video(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(256).read_to_end(&mut head))
+        .is_ok_and(|_| video::is_video(&head) && image::guess_format(&head).is_err())
+}
+
+/// Shows one image.
+struct Still {
+    image: Arc<DynamicImage>,
+    fit: Fit,
+}
+
+impl Source for Still {
+    fn render(&mut self, frame: &mut Frame) {
+        *frame = Frame::fit(&self.image, frame.width(), frame.height(), self.fit);
+    }
+
+    fn next_change(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// A decoded image file: a still picture or an animation.
+pub enum Picture {
+    /// A still image (or an animated file with a single frame).
+    Still(DynamicImage),
+    /// An animated GIF, APNG or WebP with at least two frames.
+    Animated(Animation),
+}
+
+impl Picture {
+    /// Decodes a PNG, JPEG, GIF or WebP file; animated GIF, APNG and WebP become animations.
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if let Some(animation) =
+            Animation::decode(bytes).map_err(|e| format!("cannot decode image: {e}"))?
+        {
+            return Ok(Self::Animated(animation));
+        }
+        image::load_from_memory(bytes)
+            .map(Self::Still)
+            .map_err(|e| format!("cannot decode image: {e}"))
+    }
+
+    /// The still image, or the first frame of the animation.
+    pub fn first(&self) -> &DynamicImage {
+        match self {
+            Self::Still(image) => image,
+            Self::Animated(animation) => animation.first(),
+        }
+    }
+
+    /// The content that shows this picture.
+    pub fn into_content(self, fit: Fit) -> Content {
+        match self {
+            Self::Still(image) => Content::Image {
+                image: Arc::new(image),
+                fit,
+            },
+            Self::Animated(animation) => Content::Animation {
+                animation: Arc::new(animation),
+                fit,
+            },
+        }
+    }
+}
